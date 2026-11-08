@@ -49,6 +49,19 @@ static const uint32_t (*c0_push)[NVN2_ROOT_WORDS];
 static uint8_t geometry_input;                              // normalized actual draw primitive; zero outside opt-in GS
 #define ONESHOT_WAIT_MS 1000u   // Per one-shot draw, shared across the frame on AMD.
 
+// AMD, mesh draws: a mesh pipeline compiles in over a second there. In a 4 minute run on a Radeon 780M every one of 59
+// mesh waits ran out the whole 1000 ms and the draw was skipped anyway (61 s lost). A mesh draw waits at most this long
+// instead: TOTK_MESH_WAIT_MS, 0 = never wait, default 200.
+static uint32_t mesh_wait_cap_ms(void) {
+    static int cap = -1;
+    if (cap < 0) {
+        const char *e = getenv("TOTK_MESH_WAIT_MS");
+        cap = e && *e ? atoi(e) : 200;
+        if (cap < 0) cap = 0;
+    }
+    return (uint32_t)cap;
+}
+
 static void c0_lay_set(VkExec *ex, const GfxShader *cs) {
     c0_lay = gfx_shader_c0_layout(cs);
     c0_push = ex->push[1];
@@ -3070,6 +3083,8 @@ static int prepare_draw(VkExec *ex, int prim, int32_t count, int restart) {
         budget_ns = &wait_left_ns;
     }
     if (budget_ns) wait_ms = (uint32_t)(*budget_ns / 1000000);
+    const uint32_t mesh_cap = vk_caps.amd && mesh_task_draw ? mesh_wait_cap_ms() : UINT32_MAX;
+    if (wait_ms > mesh_cap) wait_ms = mesh_cap;
     // The previous draw's pipeline while its state repeats (PM, TOTK_PIPE_MEMO=0 turns it off): the cache key is made
     // from the state alone, and a pipeline once found only changes from its fast link to its optimised build, read
     // from the info the cache entry keeps.
@@ -3088,6 +3103,7 @@ static int prepare_draw(VkExec *ex, int prim, int32_t count, int restart) {
         }
         why = oneshot > 0 ? "one-shot, shader" : wait_ms ? "full-screen" : NULL;
         uint32_t oneshot_wait_ms = vk_caps.amd ? (uint32_t)(oneshot_left_ns / 1000000) : ONESHOT_WAIT_MS;
+        if (oneshot_wait_ms > mesh_cap) oneshot_wait_ms = mesh_cap;
         if (pending && oneshot < 0 && oneshot_wait_ms && !vk_exec_targets_recent(ex, skip >= 1)) {
             perf_count(PERF_CNT_ONESHOT_WAIT);
             why = "one-shot";
