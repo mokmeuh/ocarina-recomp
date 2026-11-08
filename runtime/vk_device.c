@@ -296,6 +296,7 @@ static int create_device(void) {
     if (!c->fault.deviceFault) g_vk.has_device_fault = 0;   // vkGetDeviceFaultInfoEXT needs the feature, not just the extension
     g_vk.has_buffer_device_address = c->f12.bufferDeviceAddress;
     g_vk.has_astc_ldr = h->textureCompressionASTC_LDR;
+    g_vk.has_pipeline_creation_cache_control = c->f13.pipelineCreationCacheControl;   // cache probe (vk_pipeline.c)
     {
         const char *e = cfg_get("TOTK_FEEDBACK");
         int layout_ok = has_fbl && has_lr && c->fbl.attachmentFeedbackLoopLayout && c->lr.dynamicRenderingLocalRead;

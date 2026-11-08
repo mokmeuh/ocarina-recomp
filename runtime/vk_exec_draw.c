@@ -388,7 +388,8 @@ static void make_dummy(int i, VkFormat fmt, VkImage *image, VmaAllocation *alloc
     VkImageCreateInfo ii = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .flags = dinfo[i].f, .imageType = dinfo[i].t,
                             .format = fmt, .extent = {1, 1, 1}, .mipLevels = 1, .arrayLayers = dinfo[i].layers,
                             .samples = dinfo[i].s, .tiling = VK_IMAGE_TILING_OPTIMAL,
-                            .usage = VK_IMAGE_USAGE_SAMPLED_BIT | (ms ? 0 : VK_IMAGE_USAGE_STORAGE_BIT),
+                            .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                                     (ms ? 0 : VK_IMAGE_USAGE_STORAGE_BIT),
                             .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED};
     VmaAllocationCreateInfo ia = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
     if (vmaCreateImage(c->vma, &ii, &ia, image, alloc, NULL) != VK_SUCCESS) rt_fatal("vk: stand-in image %d failed", i);
@@ -401,15 +402,38 @@ static void make_dummy(int i, VkFormat fmt, VkImage *image, VmaAllocation *alloc
         vi.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
         if (vkCreateImageView(c->device, &vi, NULL, sview) != VK_SUCCESS) rt_fatal("vk: stand-in view failed");
     }
+    VkImageSubresourceRange range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, dinfo[i].layers};
     VkImageMemoryBarrier2 bar = {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
-                                 .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
-                                 .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT,
-                                 .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+                                 .dstStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                                 .dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                                 .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                                  .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                                 .image = *image, .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, dinfo[i].layers}};
+                                 .image = *image, .subresourceRange = range};
     VkCommandBuffer cb = vk_upload_begin();
     VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &bar};
     vkCmdPipelineBarrier2(cb, &di);
+    VkClearColorValue cv;
+    memset(&cv, 0, sizeof cv);
+    switch (fmt) {
+    case VK_FORMAT_R8_UINT: case VK_FORMAT_R8G8_UINT: case VK_FORMAT_R8G8B8A8_UINT: case VK_FORMAT_R8_SINT:
+    case VK_FORMAT_R8G8_SINT: case VK_FORMAT_R8G8B8A8_SINT: case VK_FORMAT_R16_UINT: case VK_FORMAT_R16G16_UINT:
+    case VK_FORMAT_R16G16B16A16_UINT: case VK_FORMAT_R16_SINT: case VK_FORMAT_R16G16_SINT:
+    case VK_FORMAT_R16G16B16A16_SINT: case VK_FORMAT_R32_UINT: case VK_FORMAT_R32G32_UINT:
+    case VK_FORMAT_R32G32B32A32_UINT: case VK_FORMAT_R32_SINT: case VK_FORMAT_R32G32_SINT:
+    case VK_FORMAT_R32G32B32A32_SINT: case VK_FORMAT_A2B10G10R10_UINT_PACK32:
+        break;
+    default:
+        cv.float32[0] = cv.float32[1] = cv.float32[2] = 0.5f, cv.float32[3] = 1.0f;
+    }
+    vkCmdClearColorImage(cb, *image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &cv, 1, &range);
+    bar.srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+    bar.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    bar.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+    bar.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
+    bar.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    bar.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    VkDependencyInfo di2 = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &bar};
+    vkCmdPipelineBarrier2(cb, &di2);
     vk_upload_end();
 }
 
@@ -1133,8 +1157,36 @@ static void dyn_collect(VkExec *ex, const VkPipeInfo *info, int st) {
             now[out].addr = found[i], now[out].size = size;
             out++;
         }
+        static int stats = -1;   // LOCAL TEST (Ocarina): OOT_SSBO_STATS: lists-by-length histogram, logged every 5000 calls
+        if (stats < 0) stats = getenv("OOT_SSBO_STATS") != NULL;
+        if (stats) {
+            static uint64_t hist[2][DYN_N + 1], calls;
+            hist[st == NVN_STAGE_CS ? 1 : 0][out]++;
+            if (++calls % 5000 == 0) {
+                char buf[1024];
+                int p = 0;
+                for (int h = 0; h < 2; h++) {
+                    if (p > (int)sizeof buf - 1) p = (int)sizeof buf - 1;
+                    p += snprintf(buf + p, sizeof buf - (size_t)p, "%s", h ? "; compute lists by length:" : "ssbo-stats: graphics lists by length:");
+                    for (int j = 0; j <= DYN_N; j++)
+                        if (hist[h][j]) {
+                            if (p > (int)sizeof buf - 1) p = (int)sizeof buf - 1;
+                            p += snprintf(buf + p, sizeof buf - (size_t)p, " %d:%llu", j, (unsigned long long)hist[h][j]);
+                        }
+                }
+                if (p > (int)sizeof buf - 1) p = (int)sizeof buf - 1;
+                p += snprintf(buf + p, sizeof buf - (size_t)p, "; over %d", over);
+                rt_log("%s", buf);
+            }
+        }
         static int told;
         if (over && !told++) rt_log("vk: %d more buffers reachable than a compute shader can test", over);
+        // LOCAL TEST (Ocarina): OOT_GUARD_CAP bounds the guarded search vk_pipeline.c spirv_guard_shorten leaves in the
+        // shader, so a graphics list past it reads zero for the rest; log once ever.
+        static int gcap = -1, gcap_told;
+        if (gcap < 0) { const char *e = getenv("OOT_GUARD_CAP"); gcap = e ? atoi(e) : 10; if (gcap <= 0 || gcap >= 32) gcap = 0; }
+        if (st != NVN_STAGE_CS && gcap && out > gcap && !gcap_told++)
+            rt_log("vk: a graphics stage reaches %d buffers, more than OOT_GUARD_CAP %d: the extra ones read zero", out, gcap);
     }
     {   // LOCAL TEST (Ocarina): OOT_DYN_COV=<frame>: compute only: the pointers in each bound uniform and storage buffer that the list does not cover
         static long at = -2;

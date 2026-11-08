@@ -57,8 +57,9 @@
 
 enum { SPV_OP_ENTRY_POINT = 15, SPV_OP_TYPE_INT = 21, SPV_OP_TYPE_FLOAT = 22, SPV_OP_TYPE_VECTOR = 23,
        SPV_OP_TYPE_POINTER = 32, SPV_OP_CONSTANT = 43, SPV_OP_CONSTANT_COMPOSITE = 44,
-       SPV_OP_CONSTANT_NULL = 46, SPV_OP_FUNCTION = 54, SPV_OP_VARIABLE = 59,
-       SPV_OP_DECORATE = 71, SPV_DEC_BUILTIN = 11, SPV_DEC_LOCATION = 30, SPV_DEC_INDEX = 32, SPV_DEC_BINDING = 33, SPV_DEC_DESCRIPTOR_SET = 34,
+       SPV_OP_CONSTANT_NULL = 46, SPV_OP_FUNCTION = 54, SPV_OP_FUNCTION_END = 56, SPV_OP_VARIABLE = 59,
+       SPV_OP_ACCESS_CHAIN = 65, SPV_OP_DECORATE = 71, SPV_DEC_BUILTIN = 11, SPV_DEC_LOCATION = 30, SPV_DEC_INDEX = 32,
+       SPV_DEC_BINDING = 33, SPV_DEC_DESCRIPTOR_SET = 34, SPV_OP_LABEL = 248, SPV_OP_RETURN = 253, SPV_OP_RETURN_VALUE = 254,
        SPV_SC_OUTPUT = 3 };
 
 #define MAX_BINDINGS 256   // LOCAL TEST (Ocarina): was 128; guarded vertex and fragment stages together passed it and the draws were lost
@@ -1438,7 +1439,97 @@ static const uint32_t *fs_spirv_over(const GfxShader *fs, uint64_t *words) {   /
     return o ? o : w;
 }
 
-static VkShaderModule make_module_linked(const uint32_t *w, uint64_t words, int geometry_chain) {
+// LOCAL TEST (Ocarina): the translator (tools/xlate/patches/0015) emits a guarded storage-buffer search helper that
+// tests 32 runtime candidates (constant offsets 144..175) in one long chain; it is called hundreds of times per shader
+// and the driver inlines every call, so the module balloons and graphics pipelines take minutes. A graphics stage's
+// reachable list (dyn_collect in vk_exec_draw.c) never holds more than a handful of entries, so the candidates past
+// OOT_GUARD_CAP are dead weight. The cap is read once; a value <= 0 or >= 32 turns the pass off.
+static int guard_cap(void) {
+    static int cap = -1;
+    if (cap < 0) {
+        const char *e = getenv("OOT_GUARD_CAP");
+        cap = e ? atoi(e) : 10;
+        if (cap <= 0 || cap >= 32) cap = 0;
+    }
+    return cap;
+}
+
+// Rewrites each guarded storage-buffer helper so it returns right after the candidate at offset 144+cap, dropping the
+// rest of the 32-candidate chain. A helper is a function whose OpAccessChain instructions (three index operands: the
+// constants 0, 144..175, 0) cover every one of the 32 offsets. Everything after the label of the block that holds the
+// access at 144+cap, up to but not including OpFunctionEnd, is replaced with the return just before OpFunctionEnd; ids
+// and the bound stay unchanged and the function-scope OpVariables at the top of the function are untouched. NULL when
+// nothing matched or the input is malformed: the module is used as-is.
+static uint32_t *spirv_guard_shorten(const uint32_t *w, uint64_t n, uint64_t *out_n) {
+    int cap = guard_cap();
+    if (!cap || n < 5) return NULL;
+    uint32_t bound = w[3];
+    if (!bound || bound > (1u << 22)) return NULL;
+    uint32_t *cval = malloc((size_t)bound * 4);
+    uint8_t *cset = calloc(bound, 1);
+    struct rec { uint64_t label, ret, end; uint32_t ret_len; } *recs = NULL;
+    if (!cval || !cset) { free(cval); free(cset); return NULL; }
+    int nrecs = 0, recs_cap = 0, in_fn = 0, have_label = 0, have_cap = 0;
+    uint32_t mask = 0, last_ret_len = 0;
+    uint64_t cur_label = 0, cap_label = 0, last_ret = 0;
+    for (uint64_t i = 5; i < n;) {
+        uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
+        if (!len || i + len > n) goto fail;
+        const uint32_t *a = w + i + 1;
+        if (op == SPV_OP_CONSTANT && len >= 4 && a[1] < bound) cval[a[1]] = a[2], cset[a[1]] = 1;
+        else if (op == SPV_OP_FUNCTION) in_fn = 1, mask = 0, have_label = 0, have_cap = 0, cur_label = 0, cap_label = 0, last_ret = 0, last_ret_len = 0;
+        else if (in_fn && op == SPV_OP_LABEL && len >= 2) cur_label = i, have_label = 1;
+        else if (in_fn && op == SPV_OP_ACCESS_CHAIN && len == 7 && a[3] < bound && a[4] < bound && a[5] < bound &&
+                 cset[a[3]] && cset[a[4]] && cset[a[5]] && cval[a[3]] == 0 && cval[a[4]] >= 144 && cval[a[4]] <= 175 && cval[a[5]] == 0) {
+            uint32_t v = cval[a[4]];
+            mask |= 1u << (v - 144);
+            if (v == (uint32_t)(144 + cap) && !have_cap && have_label) cap_label = cur_label, have_cap = 1;
+        } else if (in_fn && (op == SPV_OP_RETURN || op == SPV_OP_RETURN_VALUE)) last_ret = i, last_ret_len = len;
+        else if (op == SPV_OP_FUNCTION_END) {
+            if (in_fn && mask == 0xffffffffu && have_cap && last_ret && last_ret + last_ret_len == i) {
+                if (nrecs == recs_cap) {
+                    int nc = recs_cap ? recs_cap * 2 : 16;
+                    struct rec *nr = realloc(recs, (size_t)nc * sizeof *recs);
+                    if (!nr) goto fail;
+                    recs = nr, recs_cap = nc;
+                }
+                recs[nrecs++] = (struct rec){cap_label, last_ret, i, last_ret_len};
+            }
+            in_fn = 0;
+        }
+        i += len;
+    }
+    if (!nrecs) goto fail;
+    uint32_t *o = malloc((size_t)n * 4);
+    if (!o) goto fail;
+    uint32_t *p = o;
+    memcpy(p, w, 5 * 4), p += 5;
+    for (uint64_t i = 5, h = 0; i < n;) {
+        uint32_t len = w[i] >> 16;
+        if (h < nrecs && i == recs[h].label) {
+            memcpy(p, w + i, (size_t)len * 4), p += len;
+            memcpy(p, w + recs[h].ret, (size_t)recs[h].ret_len * 4), p += recs[h].ret_len;
+            i = recs[h].end, h++;
+            continue;
+        }
+        memcpy(p, w + i, (size_t)len * 4), p += len;
+        i += len;
+    }
+    *out_n = (uint64_t)(p - o);
+    static int logged;
+    if (logged < 5) {
+        logged++;
+        rt_log("vk_pipeline: guard cap %d: %d helper(s) shortened, %llu words before, %llu words after",
+               cap, nrecs, (unsigned long long)n, (unsigned long long)(p - o));
+    }
+    free(cval), free(cset), free(recs);
+    return o;
+fail:
+    free(cval), free(cset), free(recs);
+    return NULL;
+}
+
+static VkShaderModule make_module_linked(const uint32_t *w, uint64_t words, int geometry_chain, int guard) {
     uint64_t over_n = 0;
     uint32_t *over = spv_override(w, words, &over_n);
     if (over) w = over, words = over_n;
@@ -1447,17 +1538,21 @@ static VkShaderModule make_module_linked(const uint32_t *w, uint64_t words, int 
     uint64_t fixed_n = 0;
     uint32_t *fixed = spirv_is_mesh(w, words) ? NULL : geometry_chain ? spirv_fixup_linked(w, words, &fixed_n, 1) : spirv_fixup(w, words, &fixed_n);
     if (fixed) w = fixed, words = fixed_n;
+    uint64_t guarded_n = 0;
+    uint32_t *guarded = guard ? spirv_guard_shorten(w, words, &guarded_n) : NULL;
+    if (guarded) w = guarded, words = guarded_n;
     VkShaderModuleCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = (size_t)words * 4, .pCode = w};
     VkShaderModule m = VK_NULL_HANDLE;
     VkResult r = vkCreateShaderModule(P.device, &ci, NULL, &m);
+    free(guarded);
     free(fixed);
     free(minmax);
     free(over);
     return r == VK_SUCCESS ? m : VK_NULL_HANDLE;
 }
 
-static VkShaderModule make_module(const uint32_t *w, uint64_t words) {
-    return make_module_linked(w, words, 0);
+static VkShaderModule make_module(const uint32_t *w, uint64_t words, int guard) {
+    return make_module_linked(w, words, 0, guard);
 }
 
 // Experimental GS accepts a deliberately bounded interface: unpacked 32-bit
@@ -2407,7 +2502,7 @@ static uint64_t gfx_noopt_words(void) {
     static uint64_t w = ~0ull;
     if (w == ~0ull) {
         const char *e = getenv("TOTK_GFX_NOOPT_WORDS");
-        w = e ? strtoull(e, NULL, 0) : 30000u;
+        w = e ? strtoull(e, NULL, 0) : 0u;
         if (!w) w = ~0ull - 1;
     }
     return w;
@@ -2417,19 +2512,20 @@ static uint64_t gfx_skip_words(void) {
     static uint64_t w = ~0ull;
     if (w == ~0ull) {
         const char *e = getenv("TOTK_GFX_SKIP_WORDS");
-        w = e ? strtoull(e, NULL, 0) : 100000u;
+        w = e ? strtoull(e, NULL, 0) : 0u;
         if (!w) w = ~0ull - 1;
     }
     return w;
 }
 
 // LOCAL TEST (Ocarina): measured on an AMD iGPU, a fragment stage this large hangs the compiler for minutes; with a
-// mesh stage their sum does too. TOTK_GFX_SKIP_FS_WORDS and TOTK_GFX_SKIP_SUM_WORDS set them, 0 turns each rule off.
+// mesh stage their sum does too. TOTK_GFX_SKIP_FS_WORDS and TOTK_GFX_SKIP_SUM_WORDS set them; each rule is off by
+// default, and a positive value turns it on.
 static uint64_t gfx_skip_fs_words(void) {
     static uint64_t w = ~0ull;
     if (w == ~0ull) {
         const char *e = getenv("TOTK_GFX_SKIP_FS_WORDS");
-        w = e ? strtoull(e, NULL, 0) : 60000u;
+        w = e ? strtoull(e, NULL, 0) : 0u;
         if (!w) w = ~0ull - 1;
     }
     return w;
@@ -2439,19 +2535,20 @@ static uint64_t gfx_skip_sum_words(void) {
     static uint64_t w = ~0ull;
     if (w == ~0ull) {
         const char *e = getenv("TOTK_GFX_SKIP_SUM_WORDS");
-        w = e ? strtoull(e, NULL, 0) : 105000u;
+        w = e ? strtoull(e, NULL, 0) : 0u;
         if (!w) w = ~0ull - 1;
     }
     return w;
 }
 
 // LOCAL TEST (Ocarina): a big fragment stage with a big vertex stage hangs the compiler even without a mesh stage.
-// TOTK_GFX_SKIP_BOTH_FS_WORDS and TOTK_GFX_SKIP_BOTH_VS_WORDS set the two thresholds, 0 turns the rule off.
+// TOTK_GFX_SKIP_BOTH_FS_WORDS and TOTK_GFX_SKIP_BOTH_VS_WORDS set the two thresholds; the rule is off by default, and a
+// positive value turns it on.
 static uint64_t gfx_skip_both_fs_words(void) {
     static uint64_t w = ~0ull;
     if (w == ~0ull) {
         const char *e = getenv("TOTK_GFX_SKIP_BOTH_FS_WORDS");
-        w = e ? strtoull(e, NULL, 0) : 30000u;
+        w = e ? strtoull(e, NULL, 0) : 0u;
         if (!w) w = ~0ull - 1;
     }
     return w;
@@ -2461,10 +2558,81 @@ static uint64_t gfx_skip_both_vs_words(void) {
     static uint64_t w = ~0ull;
     if (w == ~0ull) {
         const char *e = getenv("TOTK_GFX_SKIP_BOTH_VS_WORDS");
-        w = e ? strtoull(e, NULL, 0) : 50000u;
+        w = e ? strtoull(e, NULL, 0) : 0u;
         if (!w) w = ~0ull - 1;
     }
     return w;
+}
+
+// 1 when s's graphics pipeline matches the sizes create_graphics skips on AMD (a stage of gfx_skip_words() words or
+// more, a fragment stage of gfx_skip_fs_words(), a mesh stage whose vs + fs reach gfx_skip_sum_words(), or a fragment
+// and vertex stage reaching the both thresholds): the pipelines that compile for minutes. Only on AMD, where those
+// rules apply. The word counts are read exactly as the note-building code in create_graphics reads them.
+static int gfx_is_slow(const VkPipeState *s) {
+    if (!vk_caps.amd) return 0;
+    const GfxShader *st[4] = {s->ts, s->vs, s->gs, s->fs};
+    uint64_t vs_words = 0, fs_words = 0, gfx_words = 0;
+    for (int i = 0; i < 4; i++) {
+        uint64_t w = 0;
+        if (st[i]) gfx_shader_spirv(st[i], &w);
+        if (w > gfx_words) gfx_words = w;
+        if (i == 1) vs_words = w;
+        if (i == 3) fs_words = w;
+    }
+    return gfx_words >= gfx_skip_words() || fs_words >= gfx_skip_fs_words() ||
+           (mesh_vs(s) && vs_words + fs_words >= gfx_skip_sum_words()) ||
+           (fs_words >= gfx_skip_both_fs_words() && vs_words >= gfx_skip_both_vs_words());
+}
+
+// TOTK_SLOW_LANES: slow-lane workers, read once (opt-in: off by default on every GPU, 0 keeps today's skipping).
+// Off by default because measured compiles of 120000 to 185000 word mesh stages did not finish in 18 minutes
+// each on AMD (amdvlk64.dll); TOTK_SLOW_LANES=N (N > 0) enables the lane.
+static int slow_lanes(void) {
+    static int n = -1;
+    if (n < 0) {
+        const char *e = getenv("TOTK_SLOW_LANES");
+        n = e ? atoi(e) : 0;
+        if (n < 0) n = 0;
+    }
+    return n;
+}
+
+// OOT_BIG_GFX_WORKERS: at most this many "big" graphics compiles run at once across the pool, so the machine's RAM is
+// not exhausted (each optimized huge compile uses about 1.1 GB on AMD). Read once, default 1, minimum 1.
+static int big_gfx_workers(void) {
+    static int n = -1;
+    if (n < 0) {
+        const char *e = getenv("OOT_BIG_GFX_WORKERS");
+        n = e ? atoi(e) : 1;
+        if (n < 1) n = 1;
+    }
+    return n;
+}
+
+// The calling thread is a slow-lane worker: create_graphics builds (not skips) the size rules, and the compile
+// watchdog ignores it.
+static _Thread_local int slow_worker;
+
+// LOCAL TEST (Ocarina, AMD): set by a pool worker around the cache probe of a big job: create_graphics adds
+// VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT and, when the driver answers VK_PIPELINE_COMPILE_REQUIRED
+// instead of compiling, returns VK_NULL_HANDLE without logging a failure (needs pipelineCreationCacheControl).
+static _Thread_local int gfx_probe;
+
+// OOT_PIPE_PROBE=0 turns the cache probe off; it also stays off when the device has no pipelineCreationCacheControl
+// (Vulkan 1.3, enabled when the physical device reports it, see vk_device.c). A probe that took seconds to answer means
+// the driver compiled inside a probe, so probing stops for the rest of the run.
+static int pipe_probe_on(void) {
+    static int n = -1;
+    if (n < 0) {
+        const char *e = getenv("OOT_PIPE_PROBE");
+        VkCtx *c = vk_ctx();
+        n = (!(e && !strcmp(e, "0"))) && c && c->has_pipeline_creation_cache_control;
+    }
+    return n;
+}
+static volatile int probe_stopped;   // a probe compiled for seconds: no fast cache answer, so probes stop
+static int probe_allowed(void) {
+    return pipe_probe_on() && !probe_stopped;
 }
 
 // ---- graphics pipeline compiles in flight (the perf trace names them while they run)
@@ -2473,6 +2641,7 @@ enum { ACTIVE_COMPILES = 16 };
 typedef struct {
     volatile int32_t used;
     volatile int32_t flagged;   // the watchdog found it running past TOTK_PIPE_STUCK_S
+    volatile int32_t slow;      // runs on a slow-lane worker: the watchdog leaves it alone
     double start_ms;
     char note[200];
 } ActiveCompile;
@@ -2481,13 +2650,14 @@ static PlatMutex active_compiles_lock = PLAT_MUTEX_INIT;
 
 static double now_ms(void);
 
-static int active_compile_claim(const char *note, double start_ms) {
+static int active_compile_claim(const char *note, double start_ms, int slow) {
     int slot = -1;
     plat_mutex_lock(&active_compiles_lock);
     for (int i = 0; i < ACTIVE_COMPILES; i++) {
         if (active_compiles[i].used) continue;
         active_compiles[i].used = 1;
         active_compiles[i].flagged = 0;
+        active_compiles[i].slow = slow;
         active_compiles[i].start_ms = start_ms;
         snprintf(active_compiles[i].note, sizeof active_compiles[i].note, "%s", note);
         slot = i;
@@ -2578,19 +2748,19 @@ static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Lay
             fcode = fpatched = r;
         }
         // A bound colour target outside the shader's output map gets write mask 0 (target_wmask)
-        if (fcode) fm = make_module(fcode, fw);
+        if (fcode) fm = make_module(fcode, fw, 1);
     }
     if (s->gs) {
         uint64_t gw = 0;
         const uint32_t *gcode = gfx_shader_spirv(s->gs, &gw);
         uint32_t off = binding_span(s->vs) - 1;
         uint32_t *patched = off && gcode ? spirv_rebind(gcode, gw, off) : NULL;
-        if (gcode && (!off || patched)) gm = make_module(patched ? patched : gcode, gw);
+        if (gcode && (!off || patched)) gm = make_module(patched ? patched : gcode, gw, 1);
         free(patched);
     }
     // Only a VS linked to GS uses the GS-chain dead-distance declaration policy.
     // Plain VS/FS modules retain their original fixup path and uploaded bytes.
-    vm = make_module_linked(vcode, vw, s->gs != NULL);
+    vm = make_module_linked(vcode, vw, s->gs != NULL, 1);
     free(vpatched), free(fpatched);
     VkShaderModule tm = VK_NULL_HANDLE;   // LOCAL TEST (Ocarina): the task stage, bindings after the mesh stage's
     if (s->ts) {
@@ -2598,7 +2768,7 @@ static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Lay
         const uint32_t *tcode = gfx_shader_spirv(s->ts, &tw);
         uint32_t off = binding_span(s->vs) - 1;
         uint32_t *patched = off && tcode ? spirv_rebind(tcode, tw, off) : NULL;
-        if (tcode && (!off || patched)) tm = make_module(patched ? patched : tcode, tw);
+        if (tcode && (!off || patched)) tm = make_module(patched ? patched : tcode, tw, 1);
         free(patched);
     }
     VkPipeline pipe = VK_NULL_HANDLE;
@@ -2725,7 +2895,7 @@ static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Lay
         }
     }
     int crashes = crash_count(note);
-    if (vk_caps.amd && gfx_words >= gfx_skip_words()) {
+    if (vk_caps.amd && !slow_worker && gfx_words >= gfx_skip_words()) {
         static volatile int32_t told;
         if (plat_inc32(&told) <= 30)
             rt_log("vk_pipeline: not built, a stage of %llu words is too large for this driver: %s",
@@ -2734,7 +2904,7 @@ static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Lay
     }
     // LOCAL TEST (Ocarina): measured on an AMD iGPU, a fragment stage this large (or this combined with a mesh stage)
     // hangs the driver's compiler for minutes on one CPU core per pipeline, so skip it before the compile slot is claimed.
-    if (vk_caps.amd &&
+    if (vk_caps.amd && !slow_worker &&
         (fs_words >= gfx_skip_fs_words() || (mesh_vs(s) && vs_words + fs_words >= gfx_skip_sum_words()))) {
         static volatile int32_t told;
         if (plat_inc32(&told) <= 30)
@@ -2744,7 +2914,7 @@ static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Lay
     }
     // LOCAL TEST (Ocarina): measured on an AMD iGPU, a big fragment stage with a big vertex stage hangs the compiler
     // for minutes even without a mesh stage, so skip it before the compile slot is claimed.
-    if (vk_caps.amd && fs_words >= gfx_skip_both_fs_words() && vs_words >= gfx_skip_both_vs_words()) {
+    if (vk_caps.amd && !slow_worker && fs_words >= gfx_skip_both_fs_words() && vs_words >= gfx_skip_both_vs_words()) {
         static volatile int32_t told;
         if (plat_inc32(&told) <= 30)
             rt_log("vk_pipeline: not built, a big fragment stage with a big vertex stage hangs this driver (vs %llu words, fs %llu words): %s",
@@ -2771,27 +2941,32 @@ static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Lay
         if (plat_inc32(&told) <= 20)
             rt_log("vk_pipeline: built without optimization (%u words): %s", (unsigned)gfx_words, note);
     }
+    if (gfx_probe) pi.flags |= VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT;
     plat_crash_note(note);
     int shared = cache && cache == P.cache;
     if (shared) plat_mutex_lock_shared(&cache_access);
     uint64_t t_built = qpc();
-    if (mesh_vs(s) || vs_words >= 20000 || fs_words >= 20000) {
-        static volatile int32_t told;
-        if (plat_inc32(&told) <= 80)
-            rt_log("vk_pipeline: compile start [%llu ms] %s", (unsigned long long)(qpc() / 1000000u), note);
+    int compile_slot = -1;
+    if (!gfx_probe) {
+        if (mesh_vs(s) || vs_words >= 20000 || fs_words >= 20000) {
+            static volatile int32_t told;
+            if (plat_inc32(&told) <= 80)
+                rt_log("vk_pipeline: compile start [%llu ms] %s", (unsigned long long)(qpc() / 1000000u), note);
+        }
+        compile_slot = active_compile_claim(note, now_ms(), slow_worker);
     }
-    int compile_slot = active_compile_claim(note, now_ms());
     VkResult r = vkCreateGraphicsPipelines(P.device, cache, 1, &pi, NULL, &pipe);
     // AMD's compiler gives up on large programs (-1, out of host memory, on an RX 6750 XT: the scene stayed black at
     // 1 fps). Built again without optimization, as NotRexed/Hookshot's RX_VK_NOOPT does; NVIDIA never gets here.
-    if (r != VK_SUCCESS && vk_caps.amd && !(pi.flags & VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT)) {
+    if (!gfx_probe && r != VK_SUCCESS && r != VK_PIPELINE_COMPILE_REQUIRED && vk_caps.amd &&
+        !(pi.flags & VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT)) {
         pi.flags |= VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;
         r = vkCreateGraphicsPipelines(P.device, cache, 1, &pi, NULL, &pipe);
         rt_log("vk_pipeline: graphics pipeline built again without optimization: %s", r == VK_SUCCESS ? "ok" : "failed too");
     }
     active_compile_release(compile_slot);
     double built_ms = ms_since(t_built);
-    if (built_ms > 1000.0 || mesh_vs(s)) {
+    if (!gfx_probe && (built_ms > 1000.0 || mesh_vs(s))) {
         static volatile int32_t told;
         if (plat_inc32(&told) <= 120)
             rt_log("vk_pipeline: graphics pipeline built in %.1f s (%s): %s", built_ms / 1000.0,
@@ -2801,7 +2976,7 @@ static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Lay
     plat_crash_note(NULL);
     perf_end(PERF_PIPE, p0);   // counts on the render thread only, so background builds stay out of it
     if (r != VK_SUCCESS) {
-        rt_log("vk_pipeline: vkCreateGraphicsPipelines failed (%d)", (int)r);
+        if (r != VK_PIPELINE_COMPILE_REQUIRED) rt_log("vk_pipeline: vkCreateGraphicsPipelines failed (%d)", (int)r);
         pipe = VK_NULL_HANDLE;
     } else {
         perf_count(PERF_CNT_PIPE_BUILT);
@@ -2910,7 +3085,7 @@ static VkPipeline lib_create(int kind, const VkPipeState *s, const GKey *k, VkPi
         sw = vw;
         if (pk->missing && (patched = spirv_add_outputs(vcode, vw, pk->missing, pk->fin, &n2))) vcode = patched, vw = n2;
         else if (pk->missing) LOG_ONCE("vk_pipeline: cannot add missing vertex outputs (mask %#x)", pk->missing);
-        if (!(m = make_module(vcode, vw))) goto out;
+        if (!(m = make_module(vcode, vw, 1))) goto out;
         st.stage = VK_SHADER_STAGE_VERTEX_BIT, st.module = m;
         pin_subgroup32(&st, &rq, scode, sw);
         pi.stageCount = 1, pi.pStages = &st, pi.pViewportState = &vp, pi.pRasterizationState = &rs;
@@ -2931,7 +3106,7 @@ static VkPipeline lib_create(int kind, const VkPipeState *s, const GKey *k, VkPi
             }
             patched = fcode ? spirv_set(fcode, fw, 1) : NULL;
             free(d), free(at);
-            if (!patched || !(m = make_module(patched, fw))) goto out;
+            if (!patched || !(m = make_module(patched, fw, 1))) goto out;
             st.stage = VK_SHADER_STAGE_FRAGMENT_BIT, st.module = m;
             pin_subgroup32(&st, &rq, scode, sw);
             pi.stageCount = 1, pi.pStages = &st;
@@ -3182,7 +3357,10 @@ typedef struct Job {
     uint32_t fs_off;
     uint8_t low;                       // in the low queue, or running at below-normal priority
     uint8_t prebuild, demanded;        // from the key file; a draw asked for it before it was ready
-    uint8_t large;                     // keep in the low queue so ordinary draws retain a worker
+    uint8_t large;                     // big job: its largest stage has BIG_GFX_WORDS+ words; keep in the low queue
+    uint8_t probed;                    // big job: its cache probe ran (or probing is off); a compile slot is next
+    uint8_t bg;                        // background prebuild job (a big record deferred past the boot prewarm)
+    uint8_t slow;                      // the slow lane: a pipeline create_graphics skips for size (AMD)
     int worker;                        // running on A.thread[worker]; -1 queued
     VkPipeState s;
     GKey k;
@@ -3197,10 +3375,17 @@ static struct {
     uint8_t prio_low[MAX_WORKERS];     // worker runs below normal (under P.lock)
     Job *head, *tail;                  // draws' misses
     Job *low, *low_tail;               // prebuild
-    uint32_t inflight;                 // queued or running, both queues
+    Job *slow, *slow_tail;             // the slow lane (compiles that take minutes on AMD); pool workers never take it
+    int slow_threads;
+    PlatThread *slow_thread[MAX_WORKERS];
+    uint32_t inflight;                 // queued or running, all queues
     int low_running;                   // pool workers running a job taken from the low queue
+    int big_running;                   // pool workers running a big job (a stage of BIG_GFX_WORDS+ words)
     PlatCond idle;           // with P.lock: no job queued or running
 } A = {.idle = PLAT_COND_INIT};
+
+static PlatCond slow_cv = PLAT_COND_INIT;   // wakes the slow-lane workers (with P.lock)
+static volatile int slow_stop;              // set by workers_drain; a slow worker checks it and exits
 
 // ---- pipeline keys (pipeline-keys.bin next to the pipeline cache)
 // Every graphics pipeline built in a game run appends a KeyRec: the VkPipeState it was built from with the shader
@@ -3240,6 +3425,7 @@ static struct {
     int loading;                       // the prewarm still queues records
     int warm;                          // vk_pipeline_prewarm owns the file (prebuild_start leaves it)
     uint32_t left;                     // prebuild jobs queued or running
+    uint32_t bg;                       // background prebuild jobs queued or running (deferred big records)
     uint32_t built, failed, promoted;
     double t0;                         // now_ms() when the prebuild started
 } K = {.io = PLAT_MUTEX_INIT};
@@ -3369,13 +3555,129 @@ static void prebuild_report(void) {
            "ready", K.built, K.failed, K.promoted, now_ms() - K.t0);
 }
 
+// Publishes a built pipeline (or records its failure) for a job and finishes its bookkeeping, then frees the job.
+// Caller holds P.lock. lowrun and bigrun are the reservations to release on this path (a cache-probe hit passes bigrun 0:
+// it never took a big slot).
+static void pipe_finish_job(Job *j, VkPipeline pipe, int lowrun, int bigrun) {
+    if (pipe || !j->p->fast) j->p->info.pipeline = pipe;   // a failed optimised build keeps the fast-linked one
+    if (pipe && j->p->fast) P.g.swaps++;
+    j->p->building = 0;
+    j->p->job = NULL;
+    if (pipe) {
+        P.stats.graphics++, P.stats.async_built++;
+        if (!j->prebuild) keys_note(&j->s);
+    } else {
+        P.stats.failures++;
+        rt_log("vk_pipeline: graphics pipeline not built: pipeline creation failed");
+    }
+    if (j->prebuild) {
+        if (pipe) K.built++;
+        else K.failed++;
+        K.promoted += j->demanded;
+        if (j->bg) --K.bg;                       // background prebuild: no second "prebuild done" report
+        else if (!--K.left && !K.loading) prebuild_report();
+    }
+    A.low_running -= lowrun;
+    A.big_running -= bigrun;
+    if (!--A.inflight) plat_cond_broadcast(&A.idle);
+    plat_cond_broadcast(&done_cv);
+    if (pipe && (!j->prebuild || j->demanded)) perf_count(PERF_CNT_PIPE_ASYNC);   // a draw waited for it
+    free(j);
+}
+
+// Compiles a queued graphics job and publishes its pipeline: the memory throttle, the create (with P.lock released)
+// and the shared bookkeeping pipe_worker does after its fast-link step. Caller holds P.lock. lowrun is 1 when the job
+// was taken from the low queue (already counted in A.low_running); bigrun is 1 for a big job (a stage of BIG_GFX_WORDS+
+// words), reserved in A.big_running by the caller and released here; slow is 1 for a slow-lane worker.
+static void pipe_compile_job(Job *j, int me, int lowrun, int bigrun, int slow) {
+    // Do not start a compile while the machine is nearly out of RAM: on an AMD iGPU the driver crashed inside a
+    // compile once the process had grown to 17 GiB and only a few hundred MiB were still free. Sleep in 50 ms
+    // steps with P.lock released until the threshold is met, or give up after 30 s for this job.
+    int mem_mb = -1;   // TOTK_PIPE_MEM_MB: 0 disables the throttle, > 0 overrides the threshold; read once
+    const char *mem_env = getenv("TOTK_PIPE_MEM_MB");
+    if (mem_env) mem_mb = atoi(mem_env);
+    if (mem_mb != 0) {
+        double until = now_ms() + 30000.0;
+        for (;;) {
+            float used_mb = 0, total_mb = 0, proc_mb = 0;
+            plat_mem_info(&used_mb, &total_mb, &proc_mb);
+            float free_mb = total_mb - used_mb;
+            float thresh = (!j->prebuild || j->demanded) ? 1024.0f
+                         : total_mb / 10.0f > 2048.0f ? total_mb / 10.0f : 2048.0f;
+            if (mem_mb > 0) thresh = (float)mem_mb;
+            if (free_mb >= thresh || now_ms() >= until) break;
+            LOG_ONCE("vk_pipeline: pipeline compile waits for memory: %.0f MiB free, threshold %.0f MiB", free_mb,
+                     thresh);
+            plat_mutex_unlock(&P.lock);
+            plat_sleep_ms(50);
+            plat_mutex_lock(&P.lock);
+        }
+    }
+    plat_mutex_unlock(&P.lock);
+    if (j->large || slow) {
+        static volatile int32_t told;
+        if (plat_inc32(&told) <= 20) {
+            if (slow) rt_log("vk_pipeline: slow lane starts a graphics pipeline that normally compiles for minutes");
+            else rt_log("vk_pipeline: worker %d starts a big graphics pipeline", me);
+        }
+    }
+    // As with the big compute worker, do not hold the shared driver
+    // cache during a large compilation.
+    VkPipelineCache own = (j->large || slow) ? cache_private() : VK_NULL_HANDLE;
+    VkPipeline pipe = create_graphics(&j->s, &j->k, j->l, j->fs_off, own ? own : P.cache);
+    if (own) {
+        if (pipe) cache_publish(own);
+        else vkDestroyPipelineCache(P.device, own, NULL);
+    }
+    plat_mutex_lock(&P.lock);
+    pipe_finish_job(j, pipe, lowrun, bigrun);
+}
+
+// Removes j from the low queue. Caller holds P.lock.
+static void low_unlink(Job *j) {
+    if (j->prev) j->prev->next = j->next;
+    else A.low = j->next;
+    if (j->next) j->next->prev = j->prev;
+    else A.low_tail = j->prev;
+    j->next = j->prev = NULL;
+}
+
+// 1 when a pool worker should take low-queue work now: the existing workers count rule (with 3+ library workers one is
+// reserved for draws) still holds, then a small job when one is queued, a big job whose cache probe is still due (it
+// needs no slot), else a big job when fewer than big_gfx_workers() big jobs are running. Caller holds P.lock.
+static int low_available(void) {
+    if (!A.low) return 0;
+    if (!(A.threads < 3 || !U.on || A.low_running < A.threads - 1)) return 0;
+    for (Job *j = A.low; j; j = j->next) {
+        if (!j->large) return 1;                       // a small job is always preferred
+        if (!j->probed && probe_allowed()) return 1;   // a big job still to probe runs without a slot
+    }
+    return A.big_running < big_gfx_workers();          // a probed big job within the slot limit
+}
+
+// Takes the next low-queue job for a pool worker: a small job when one is queued, then a big job whose cache probe is
+// still due, else a big job for a compile slot (only when fewer than big_gfx_workers() big jobs are running). *bigrun is
+// set when a big job is taken. Caller holds P.lock and low_available returned true.
+static Job *low_pick(int *bigrun) {
+    *bigrun = 0;
+    for (Job *j = A.low; j; j = j->next)
+        if (!j->large) { low_unlink(j); return j; }
+    for (Job *j = A.low; j; j = j->next)
+        if (!j->probed && probe_allowed()) { *bigrun = 1; low_unlink(j); return j; }   // the cache probe runs without a slot
+    Job *j = A.low;   // only probed big jobs are left in the low queue
+    *bigrun = 1;
+    low_unlink(j);
+    return j;
+}
+
 static void pipe_worker(void *arg) {
     int me = (int)(intptr_t)arg;
     plat_mutex_lock(&P.lock);
     for (;;) {
         // With 3 or more workers one never takes low-queue work, so a waiting draw's library starts at once
-        // (not with TOTK_PIPE_WAIT=draw).
-        while (!U.head && !A.head && !(A.low && (A.threads < 3 || !U.on || A.low_running < A.threads - 1))) {
+        // (not with TOTK_PIPE_WAIT=draw). Small low-queue jobs are taken before big ones; a big job is taken to run its
+        // cache probe without a slot, and to compile only when fewer than big_gfx_workers() big jobs are running.
+        while (!U.head && !A.head && !low_available()) {
             U.idle++;
             plat_cond_wait(&work_cv, &P.lock);
             U.idle--;
@@ -3393,12 +3695,12 @@ static void pipe_worker(void *arg) {
         }
         Job *j = A.head;
         int lowrun = !j;
+        int bigrun = 0;
         if (j) {
             if (!(A.head = j->next)) A.tail = NULL;
         } else {
-            j = A.low;
-            if ((A.low = j->next)) A.low->prev = NULL;
-            else A.low_tail = NULL;
+            j = low_pick(&bigrun);   // a small low-queue job first, then a big one to probe or, within the limit, compile
+            if (!j) continue;
             A.low_running++;
         }
         j->next = j->prev = NULL;
@@ -3427,6 +3729,43 @@ static void pipe_worker(void *arg) {
                 vkDestroyPipeline(P.device, f, NULL);
             }
         }
+        // Cache probe for a big job before it takes its (single) compile slot: with pipelineCreationCacheControl the
+        // driver answers VK_PIPELINE_COMPILE_REQUIRED in milliseconds when the pipeline is not in P.cache, or returns
+        // the cached pipeline. A hit publishes at once without a slot; a miss must wait for a slot like any big compile.
+        if (bigrun && !j->probed && probe_allowed()) {
+            plat_mutex_unlock(&P.lock);
+            double t0 = now_ms();
+            gfx_probe = 1;
+            VkPipeline p = create_graphics(&j->s, &j->k, j->l, j->fs_off, P.cache);
+            gfx_probe = 0;
+            double dt = now_ms() - t0;
+            plat_mutex_lock(&P.lock);
+            if (dt > 10000.0 && !probe_stopped) {
+                probe_stopped = 1;
+                rt_log("vk_pipeline: the driver compiled during a cache probe: probes off");
+            }
+            static volatile int32_t ptold;
+            if (plat_inc32(&ptold) <= 40)
+                rt_log("vk_pipeline: big pipeline %s in the cache in %.0f ms%s", p ? "found" : "not found", dt,
+                       p ? "" : "; it compiles");
+            if (p) {   // cached: publish without taking a big slot
+                pipe_finish_job(j, p, lowrun, 0);
+                continue;
+            }
+            j->probed = 1;
+            if (A.big_running >= big_gfx_workers()) {   // no slot yet: back to the head of the low queue
+                j->worker = -1;
+                j->prev = NULL, j->next = A.low;
+                if (A.low) A.low->prev = j;
+                else A.low_tail = j;
+                A.low = j;
+                A.low_running -= lowrun;
+                continue;
+            }
+            A.big_running++;   // reserve the slot for this compile
+        } else if (bigrun) {
+            A.big_running++;   // probe off or already probed: take the slot directly
+        }
         // Do not start a compile while the machine is nearly out of RAM: on an AMD iGPU the driver crashed inside a
         // compile once the process had grown to 17 GiB and only a few hundred MiB were still free. Sleep in 50 ms
         // steps with P.lock released until the threshold is met, or give up after 30 s for this job.
@@ -3450,45 +3789,28 @@ static void pipe_worker(void *arg) {
                 plat_mutex_lock(&P.lock);
             }
         }
-        plat_mutex_unlock(&P.lock);
-        if (j->large) {
-            static volatile int32_t told;
-            if (plat_inc32(&told) <= 20)
-                rt_log("vk_pipeline: worker %d starts a large graphics pipeline", me);
-        }
-        // As with the big compute worker, do not hold the shared driver
-        // cache during a large compilation.
-        VkPipelineCache own = j->large ? cache_private() : VK_NULL_HANDLE;
-        VkPipeline pipe = create_graphics(&j->s, &j->k, j->l, j->fs_off, own ? own : P.cache);
-        if (own) {
-            if (pipe) cache_publish(own);
-            else vkDestroyPipelineCache(P.device, own, NULL);
-        }
-        plat_mutex_lock(&P.lock);
-        if (pipe || !j->p->fast) j->p->info.pipeline = pipe;   // a failed optimised build keeps the fast-linked one
-        if (pipe && j->p->fast) P.g.swaps++;
-        j->p->building = 0;
-        j->p->job = NULL;
-        if (pipe) {
-            P.stats.graphics++, P.stats.async_built++;
-            if (!j->prebuild) keys_note(&j->s);
-        } else {
-            P.stats.failures++;
-            rt_log("vk_pipeline: graphics pipeline not built: pipeline creation failed");
-        }
-        if (j->prebuild) {
-            if (pipe) K.built++;
-            else K.failed++;
-            K.promoted += j->demanded;
-            if (!--K.left && !K.loading) prebuild_report();
-        }
-        A.low_running -= lowrun;
-        if (!--A.inflight) plat_cond_broadcast(&A.idle);
-        plat_cond_broadcast(&done_cv);
-        if (pipe && (!j->prebuild || j->demanded)) perf_count(PERF_CNT_PIPE_ASYNC);   // a draw waited for it
-        free(j);
+        pipe_compile_job(j, me, lowrun, bigrun, 0);
     }
     return;
+}
+
+// A slow-lane worker: builds one graphics pipeline the size rules would otherwise skip, on a dedicated thread that never
+// touches the normal pool. Runs at the lowest below-normal priority; create_graphics sees slow_worker and does not skip
+// it, and the watchdog ignores its compile. Exits when workers_drain sets slow_stop.
+static void pipe_slow_worker(void *arg) {
+    (void)arg;
+    slow_worker = 1;
+    plat_thread_priority(PLAT_PRIO_LOWEST);
+    plat_mutex_lock(&P.lock);
+    for (;;) {
+        while (!A.slow && !slow_stop) plat_cond_wait(&slow_cv, &P.lock);
+        if (slow_stop) break;
+        Job *j = A.slow;
+        if (!(A.slow = j->next)) A.slow_tail = NULL;
+        j->next = j->prev = NULL;
+        pipe_compile_job(j, -1, 0, 0, 1);
+    }
+    plat_mutex_unlock(&P.lock);
 }
 
 // One small watchdog thread, started with the pool: a graphics compile on AMD can run for many minutes and never finish;
@@ -3496,11 +3818,11 @@ static void pipe_worker(void *arg) {
 // The watchdog flags each stuck compile, remembers it as too slow (next run skips it) and adds a worker so the rest run.
 static volatile int watchdog_stop;   // set by workers_drain; the watchdog checks it every 5 s
 
-static int pipe_stuck_s(void) {      // TOTK_PIPE_STUCK_S: seconds a compile may run before it is stuck; 0 disables
-    static int s = -1;
+static int pipe_stuck_s(void) {      // TOTK_PIPE_STUCK_S: seconds a compile may run before it is stuck; off by default,
+    static int s = -1;               // a positive value turns the watchdog on, 0 disables
     if (s < 0) {
         const char *e = getenv("TOTK_PIPE_STUCK_S");
-        s = e ? atoi(e) : 90;
+        s = e ? atoi(e) : 0;
     }
     return s;
 }
@@ -3532,7 +3854,7 @@ static void pipe_watchdog(void *arg) {
         plat_mutex_lock(&active_compiles_lock);
         for (int i = 0; i < ACTIVE_COMPILES; i++) {
             ActiveCompile *c = &active_compiles[i];
-            if (!c->used || c->flagged) continue;
+            if (!c->used || c->flagged || c->slow) continue;
             double s = (now - c->start_ms) / 1000.0;
             if (s < (double)stuck_s) continue;
             c->flagged = 1;
@@ -3573,24 +3895,47 @@ static int workers_start(void) {
     return A.threads != 0;
 }
 
+// Starts the slow-lane workers (pipe_slow_worker) on first use. Caller holds P.lock.
+static void slow_workers_start(void) {
+    int want = slow_lanes();
+    if (want > MAX_WORKERS) want = MAX_WORKERS;
+    int before = A.slow_threads;
+    while (A.slow_threads < want) {
+        PlatThread *t = plat_thread_new(pipe_slow_worker, NULL, "pipe slow worker");
+        if (!t) break;
+        A.slow_thread[A.slow_threads++] = t;
+    }
+    if (A.slow_threads > before)
+        rt_log("vk_pipeline: %d background graphics slow-lane workers (TOTK_SLOW_LANES=%d)", A.slow_threads, want);
+}
+
 static void workers_drain(void) {
     watchdog_stop = 1;   // the compile watchdog checks this every 5 s and exits
+    slow_stop = 1;       // the slow-lane workers check this and exit
     plat_mutex_lock(&P.lock);
     K.loading = 0;
     for (Job *j = A.low, *n; j; j = n) {   // queued prebuild jobs are dropped, not built
         n = j->next;
         j->p->building = 0, j->p->job = NULL;
         A.inflight--;
-        if (j->prebuild) K.left--;
+        if (j->prebuild) { if (j->bg) K.bg--; else K.left--; }
         free(j);
     }
     A.low = A.low_tail = NULL;
+    for (Job *j = A.slow, *n; j; j = n) {   // queued slow-lane jobs are dropped, not built
+        n = j->next;
+        j->p->building = 0, j->p->job = NULL;
+        A.inflight--;
+        free(j);
+    }
+    A.slow = A.slow_tail = NULL;
     for (LibJob *j = U.head, *n; j; j = n) {   // queued library jobs too: their entries read as failed builds
         n = j->next;
         j->b->job = NULL, j->b->building = 0;
         free(j);
     }
     U.head = U.tail = NULL;
+    plat_cond_broadcast(&slow_cv);   // wake slow workers to see slow_stop
     while (A.inflight) plat_cond_wait(&A.idle, &P.lock);
     while (U.running) plat_cond_wait(&done_cv, &P.lock);
     plat_mutex_unlock(&P.lock);
@@ -3609,7 +3954,7 @@ int vk_pipeline_async_on(void) { return A.on; }
 // Caller holds P.lock.
 static void promote(Pipe *p) {
     Job *j = p->job;
-    if (!j || !j->low || j->large) return;
+    if (!j || j->slow || !j->low || j->large) return;
     j->low = 0, j->demanded = 1;
     if (j->worker < 0) {
         if (j->prev) j->prev->next = j->next;
@@ -3633,7 +3978,24 @@ static uint64_t graphics_shader_words(const GfxShader *shader) {
     return words;
 }
 
-// Enters a missing pipeline: built here (mode 0), or queued for a draw (1) or for the prebuild (2). Failures are
+// A graphics job counts as big when its largest stage has this many SPIR-V words: such a compile is the one that takes
+// the AMD driver minutes and about 1.1 GB each, so the pool runs at most big_gfx_workers() of them at once.
+#define BIG_GFX_WORDS 30000
+
+// The largest stage's SPIR-V word count of a graphics pipeline, read exactly as the note-building code in create_graphics
+// reads the stages (the max over the task, vertex, geometry and fragment stages).
+static uint64_t graphics_big_words(const VkPipeState *s) {
+    const GfxShader *st[4] = {s->ts, s->vs, s->gs, s->fs};
+    uint64_t big = 0;
+    for (int i = 0; i < 4; i++) {
+        uint64_t w = graphics_shader_words(st[i]);
+        if (w > big) big = w;
+    }
+    return big;
+}
+
+// Enters a missing pipeline: built here (mode 0), or queued for a draw (1), for the prebuild (2) or for the background
+// prebuild of a deferred big record (3, like 2 but it never builds synchronously and is counted under K.bg). Failures are
 // entered too. *queued: 1 when a job owns it. Caller holds P.lock.
 static Pipe *pipe_miss(const VkPipeState *s, const GKey *k, uint64_t h, int mode, int *queued) {
     *queued = 0;
@@ -3659,12 +4021,17 @@ static Pipe *pipe_miss(const VkPipeState *s, const GKey *k, uint64_t h, int mode
     if (!why && !layout_covers(s, l, fs_off, lack, sizeof lack)) why = lack, l = NULL;
     VkPipeline pipe = VK_NULL_HANDLE;
     Job *j = NULL;
-    if (!why && mode && workers_start() && (j = calloc(1, sizeof *j))) {
-        int large = mode == 1 && vk_caps.amd && !P.gpl && U.on && A.threads >= 3 &&
-                    graphics_shader_words(s->vs) + graphics_shader_words(s->fs) +
-                    graphics_shader_words(s->gs) + graphics_shader_words(s->ts) >= 60000;
-        *j = (Job){.l = l, .fs_off = fs_off, .low = mode == 2 || large, .prebuild = mode == 2,
-                   .large = large, .worker = -1, .s = *s, .k = *k};
+    int slow = mode == 1 && gfx_is_slow(s) && slow_lanes() > 0;
+    if (slow) {
+        slow_workers_start();
+        if (!A.slow_threads) slow = 0;   // no slow-lane worker: keep today's skipping (the big path below)
+    }
+    if (!why && mode && (slow || workers_start()) && (j = calloc(1, sizeof *j))) {
+        int big = graphics_big_words(s) >= BIG_GFX_WORDS;
+        *j = (Job){.l = l, .fs_off = fs_off, .low = mode >= 2 || big, .prebuild = mode >= 2,
+                   .bg = mode == 3, .large = big, .slow = slow, .worker = -1, .s = *s, .k = *k};
+    } else if (mode == 3) {
+        return NULL;   // a background prebuild the pool cannot take stays deferred: never build it synchronously
     } else if (!why && !(pipe = create_graphics(s, k, l, fs_off, P.cache))) {
         why = "pipeline creation failed";
     }
@@ -3682,19 +4049,28 @@ static Pipe *pipe_miss(const VkPipeState *s, const GKey *k, uint64_t h, int mode
     }
     j->p = p;
     p->building = 1, p->job = j;
-    if (j->low) {
+    // A big compile can still be running when the game closes, so record its key now, while it is queued, not only
+    // when it finishes. keys_note deduplicates by record hash, so the finish-time call adds nothing for it.
+    if (j->large && !j->prebuild) keys_note(&j->s);
+    if (j->slow) {
+        j->prev = NULL;
+        if (A.slow_tail) A.slow_tail->next = j;
+        else A.slow = j;
+        A.slow_tail = j;
+    } else if (j->low) {
         j->prev = A.low_tail;
         if (A.low_tail) A.low_tail->next = j;
         else A.low = j;
         A.low_tail = j;
-        if (j->prebuild) K.left++;
+        if (j->prebuild) { if (j->bg) K.bg++; else K.left++; }
     } else {
         if (A.tail) A.tail->next = j;
         else A.head = j;
         A.tail = j;
     }
     A.inflight++;
-    plat_cond_signal(&work_cv);
+    if (j->slow) plat_cond_signal(&slow_cv);
+    else plat_cond_signal(&work_cv);
     *queued = 1;
     return p;
 }
@@ -3702,7 +4078,7 @@ static Pipe *pipe_miss(const VkPipeState *s, const GKey *k, uint64_t h, int mode
 // A job still in the draw queue goes to the head of the low queue: its pipeline has (or is about to have) a fast-linked
 // one, so the optimised build waits behind other draws' misses. Caller holds P.lock.
 static void job_lower(Job *j) {
-    if (!j || j->worker >= 0 || j->low) return;
+    if (!j || j->slow || j->worker >= 0 || j->low) return;
     if (A.head == j) {
         if (!(A.head = j->next)) A.tail = NULL;
     } else {
@@ -3903,6 +4279,17 @@ static void warm_builder(void *arg) {
 
 static void lb_start(const uint32_t pr_hist[16], const uint32_t fs_hist[4]);
 
+// OOT_PREWARM_BG=0 keeps the boot prewarm's deferral of big records on AMD: they are not queued for the background.
+// Otherwise the records the prewarm defers are queued to the pool as big prebuild jobs once the others are built.
+static int prewarm_bg(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("OOT_PREWARM_BG");
+        on = !e || strcmp(e, "0") != 0;
+    }
+    return on;
+}
+
 void vk_pipeline_prewarm(void) {
     const char *gpu = rt_config()->gpu;
     uint32_t pr_hist[16] = {0}, fs_hist[4] = {0};   // library state of the recorded pipelines (lb_start)
@@ -3955,6 +4342,9 @@ void vk_pipeline_prewarm(void) {
         rt_log("vk_pipeline: vertex output unions: %u vertex shaders, %.2f locations each; %llu pairs read %.2f each",
                VO.n, VO.n ? (double)uni / VO.n : 0.0, (unsigned long long)pairs, pairs ? (double)pair / pairs : 0.0);
     }
+    typedef struct { size_t idx; const GfxShader *vs, *fs, *ts; } BgRec;
+    BgRec *bg = prewarm_bg() && vk_caps.amd ? malloc(n * sizeof *bg) : NULL;
+    uint32_t bg_n = 0;
     uint32_t queued = 0, dropped = 0, known = 0, deferred = 0;
     plat_mutex_lock(&P.lock);
     K.t0 = t1;
@@ -3972,6 +4362,7 @@ void vk_pipeline_prewarm(void) {
             // Let the draw queue compile large shaders on demand. AMD can
             // spend minutes on one of these, blocking the startup join.
             if (graphics_shader_words(vs) + graphics_shader_words(fs) + graphics_shader_words(ts) >= 60000) {
+                if (bg) bg[bg_n++] = (BgRec){.idx = i, .vs = vs, .fs = fs, .ts = ts};
                 deferred++;
                 continue;
             }
@@ -4002,9 +4393,24 @@ void vk_pipeline_prewarm(void) {
             rt_log("vk_pipeline: prewarm: %u of %u pipelines, %.0f ms", K.built + K.failed, queued, now_ms() - t1);
     plat_mutex_lock(&P.lock);
     while (K.left) plat_cond_wait(&done_cv, &P.lock);   // jobs a pool worker took
+    uint32_t bgq = 0;
+    if (bg) {   // queue the deferred big records for the background, with the same one-at-a-time rule and cache probe
+        for (uint32_t i = 0; i < bg_n; i++) {
+            VkPipeState s = {0};
+            memcpy(&s, r[bg[i].idx].state, sizeof r[bg[i].idx].state);
+            s.vs = bg[i].vs, s.fs = bg[i].fs, s.ts = bg[i].ts;
+            GKey k;
+            gkey_fill(&s, &k);
+            uint64_t h = key_hash(&k, sizeof k);
+            int q = 0;
+            if (!pipe_find(&k, sizeof k, h)) pipe_miss(&s, &k, h, 3, &q), bgq += (uint32_t)q;
+        }
+    }
+    free(bg);
     rt_log("vk_pipeline: prewarm: %zu records in %s: %u pipelines built, %u failed, %u already built, %u deferred, %u dropped "
-           "(shader neither cached nor stored); shaders %.0f ms, pipelines %.0f ms on %d threads, total %.0f ms",
-           n, K.path, K.built, K.failed, known, deferred, dropped, t1 - t0, now_ms() - t1, nt, now_ms() - t0);
+           "(shader neither cached nor stored), %u queued for the background; shaders %.0f ms, pipelines %.0f ms on %d "
+           "threads, total %.0f ms",
+           n, K.path, K.built, K.failed, known, deferred, dropped, bgq, t1 - t0, now_ms() - t1, nt, now_ms() - t0);
     free(K.file);
     K.file = NULL;
     plat_mutex_unlock(&P.lock);
@@ -4041,7 +4447,7 @@ static _Thread_local VkPipelineCache cs_build_cache;   // the big compute worker
 static VkPipeline compute_create(const GfxShader *cs, const Layout *l) {
     uint64_t words;
     const uint32_t *code = gfx_shader_spirv(cs, &words);
-    VkShaderModule m = make_module(code, words);
+    VkShaderModule m = make_module(code, words, 0);
     if (!m) return VK_NULL_HANDLE;
     VkPipelineShaderStageRequiredSubgroupSizeCreateInfo rqc;
     VkComputePipelineCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
@@ -4662,8 +5068,8 @@ int vk_pipeline_queue_status(char *out, size_t cap) {
     for (int i = 0; i < PIPE_BUCKETS; i++)
         for (const Pipe *p = pipes[i]; p; p = p->next)
             if (p->building && !p->info.pipeline) building++;
-    int n = snprintf(out, cap, "queue: normal %d low %d (large %d) running-low %d inflight %d workers %d pipes-building %d",
-                     normal, low, large, A.low_running, (int)A.inflight, A.threads, building);
+    int n = snprintf(out, cap, "queue: normal %d low %d (big %d) running-low %d running-big %d inflight %d workers %d pipes-building %d",
+                     normal, low, large, A.low_running, A.big_running, (int)A.inflight, A.threads, building);
     double starts[ACTIVE_COMPILES];
     char notes[ACTIVE_COMPILES][200];
     size_t active = 0;
