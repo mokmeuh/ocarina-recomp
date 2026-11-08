@@ -1667,9 +1667,23 @@ static VkSampler make_sampler(VkCtx *c, const samp_par *d) {
     if (si.maxLod < si.minLod) si.maxLod = si.minLod;
     float lim = c->props.limits.maxSamplerLodBias;
     si.mipLodBias = fmaxf(-lim, fminf(lim, d->lod_bias));
-    if (d->aniso > 1) {
+    float aniso = d->aniso;
+    {   // The game asks for little anisotropy (the Switch left most samplers at 1-2x): ground and walls seen at a slant
+        // blur. A floor on trilinear colour samplers; TOTK_ANISO=<2..16> sets it (default 8), 0 or 1 keeps the game's own.
+        static int aniso_floor = -1;
+        if (aniso_floor < 0) {
+            const char *e = getenv("TOTK_ANISO");
+            aniso_floor = e && *e ? atoi(e) : 8;
+            if (aniso_floor < 0 || aniso_floor > 16) aniso_floor = 8;
+        }
+        if (aniso_floor > 1 && aniso < (float)aniso_floor && d->magf == NVN_MAG_FILTER_LINEAR &&
+            (mf == NVN_MIN_FILTER_LINEAR_MIPMAP_NEAREST || mf == NVN_MIN_FILTER_LINEAR_MIPMAP_LINEAR) && !d->cmp_mode &&
+            !d->reduction)
+            aniso = (float)aniso_floor;
+    }
+    if (aniso > 1) {
         si.anisotropyEnable = VK_TRUE;
-        si.maxAnisotropy = fminf(d->aniso, c->props.limits.maxSamplerAnisotropy);
+        si.maxAnisotropy = fminf(aniso, c->props.limits.maxSamplerAnisotropy);
     }
     if (d->cmp_mode) {
         si.compareEnable = VK_TRUE;
