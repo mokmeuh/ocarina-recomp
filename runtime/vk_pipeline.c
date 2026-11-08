@@ -2461,9 +2461,12 @@ static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Lay
         }
     }
     int crashes = crash_count(note);
-    if (crashes >= 2) {
+    // A mesh pipeline that crashed amdvlk64.dll crashes it again without optimization; each crash kills the game.
+    int amd_mesh = vk_caps.amd && mesh_vs(s) && crashes;
+    if (crashes >= 2 || amd_mesh) {
         static volatile int32_t told;
-        if (plat_inc32(&told) <= 8) rt_log("vk_pipeline: not built, the driver crashed in it twice: %s", note);
+        if (plat_inc32(&told) <= 8)
+            rt_log("vk_pipeline: not built, the driver crashed in it %s: %s", crashes >= 2 ? "twice" : "once", note);
         goto out;
     }
     if (crashes) {
@@ -2872,7 +2875,7 @@ typedef struct Job {
     GKey k;
 } Job;
 
-#define MAX_WORKERS 8
+#define MAX_WORKERS 4
 
 static struct {
     int on;                            // set once by vk_pipeline_async_enable, before the replay runs
@@ -3111,6 +3114,29 @@ static void pipe_worker(void *arg) {
                 vkDestroyPipeline(P.device, f, NULL);
             }
         }
+        // Do not start a compile while the machine is nearly out of RAM: on an AMD iGPU the driver crashed inside a
+        // compile once the process had grown to 17 GiB and only a few hundred MiB were still free. Sleep in 50 ms
+        // steps with P.lock released until the threshold is met, or give up after 30 s for this job.
+        int mem_mb = -1;   // TOTK_PIPE_MEM_MB: 0 disables the throttle, > 0 overrides the threshold; read once
+        const char *mem_env = getenv("TOTK_PIPE_MEM_MB");
+        if (mem_env) mem_mb = atoi(mem_env);
+        if (mem_mb != 0) {
+            double until = now_ms() + 30000.0;
+            for (;;) {
+                float used_mb = 0, total_mb = 0, proc_mb = 0;
+                plat_mem_info(&used_mb, &total_mb, &proc_mb);
+                float free_mb = total_mb - used_mb;
+                float thresh = (!j->prebuild || j->demanded) ? 1024.0f
+                             : total_mb / 10.0f > 2048.0f ? total_mb / 10.0f : 2048.0f;
+                if (mem_mb > 0) thresh = (float)mem_mb;
+                if (free_mb >= thresh || now_ms() >= until) break;
+                LOG_ONCE("vk_pipeline: pipeline compile waits for memory: %.0f MiB free, threshold %.0f MiB", free_mb,
+                         thresh);
+                plat_mutex_unlock(&P.lock);
+                plat_sleep_ms(50);
+                plat_mutex_lock(&P.lock);
+            }
+        }
         plat_mutex_unlock(&P.lock);
         // As with the big compute worker, do not hold the shared driver
         // cache during a large compilation.
@@ -3147,13 +3173,11 @@ static void pipe_worker(void *arg) {
     return;
 }
 
-// Starts the pool on first use: a quarter of the logical processors, 2 to 4 (on AMD, where a pipeline
-// compile takes ~1 s, half of them, 2 to 8). Caller holds P.lock.
+// Starts the pool on first use: a quarter of the logical processors, 2 to 4. Caller holds P.lock.
 static int workers_start(void) {
     if (A.threads) return 1;
     uint32_t cpus = plat_cpu_usable();
-    uint32_t div = vk_caps.amd ? 2 : 4, cap = vk_caps.amd ? 8 : 4;
-    int n = cpus / div < 2 ? 2 : cpus / div > cap ? (int)cap : (int)(cpus / div);
+    int n = cpus / 4 < 2 ? 2 : cpus / 4 > 4 ? 4 : (int)(cpus / 4);
     for (int i = 0; i < n; i++) {
         PlatThread *t = plat_thread_new(pipe_worker, (void *)(intptr_t)A.threads, "pipe worker");
         if (!t) break;
