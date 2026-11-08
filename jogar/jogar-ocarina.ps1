@@ -27,4 +27,39 @@ if ((Test-Path -LiteralPath $erros) -and (Get-Item -LiteralPath $erros).Length -
 }
 Set-Location (Join-Path $raiz "build\oot111")
 $extras = if ($args.Count) { @{ ArgumentList = $args } } else { @{} }
-Start-Process .\ocarina.exe @extras -RedirectStandardOutput $saida -RedirectStandardError $erros
+$proc = Start-Process .\ocarina.exe @extras -PassThru -RedirectStandardOutput $saida -RedirectStandardError $erros
+# The game only reads the controller while its window has the focus: hide the console that comes with it and bring the game to the front.
+Add-Type @'
+using System; using System.Text; using System.Runtime.InteropServices;
+public class OcaFront {
+    delegate bool EP(IntPtr h, IntPtr l);
+    [DllImport("user32.dll")] static extern bool EnumWindows(EP cb, IntPtr l);
+    [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+    [DllImport("user32.dll")] static extern int GetClassName(IntPtr h, StringBuilder s, int n);
+    [DllImport("user32.dll")] static extern bool ShowWindow(IntPtr h, int c);
+    [DllImport("user32.dll")] static extern bool SetForegroundWindow(IntPtr h);
+    [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] static extern bool AttachThreadInput(uint a, uint b, bool f);
+    [DllImport("kernel32.dll")] static extern uint GetCurrentThreadId();
+    public static bool Go(uint pid) {
+        IntPtr game = IntPtr.Zero;
+        EnumWindows((h, l) => {
+            uint p; GetWindowThreadProcessId(h, out p);
+            if (p != pid) return true;
+            var c = new StringBuilder(64); GetClassName(h, c, 64); string n = c.ToString();
+            if (n == "TotKRecompWindow") game = h;
+            else if (n == "PseudoConsoleWindow" || n == "ConsoleWindowClass") ShowWindow(h, 0);
+            return true;
+        }, IntPtr.Zero);
+        if (game == IntPtr.Zero) return false;
+        uint fp; uint ft = GetWindowThreadProcessId(GetForegroundWindow(), out fp); uint me = GetCurrentThreadId();
+        AttachThreadInput(me, ft, true); ShowWindow(game, 9); SetForegroundWindow(game); AttachThreadInput(me, ft, false);
+        return true;
+    }
+}
+'@
+$visto = 0
+for ($i = 0; $i -lt 160 -and $visto -lt 20 -and -not $proc.HasExited; $i++) {
+    if ([OcaFront]::Go([uint32]$proc.Id)) { $visto++ }
+    Start-Sleep -Milliseconds 500
+}
