@@ -2358,15 +2358,15 @@ static uint32_t vs_union_missing(const VkPipeState *s, GfxShaderIo fin[32]) {
 // (platform last-chance filter), a line per crash. An RX 6750 XT crashed in amdvlk64.dll building a mesh pipeline
 // early in play. Crashed once: built without optimization. Twice: not built, its draws are skipped. Deleting the file
 // tries them all again.
-static char *crashed;   // the file's text; written once at init (keys_open), read by the build threads
+static char *crashed;          // the file's text; written once at init (keys_open), read by the build threads
+static char crash_path[1024];  // pipeline-crash.txt next to pipeline-keys.bin (crashed_open, vk_pipeline_note_slow)
 static void crashed_open(const char *keys_path) {
-    static char path[1024];
-    snprintf(path, sizeof path, "%s", keys_path);
-    char *slash = strrchr(path, '\\'), *fslash = strrchr(path, '/');
+    snprintf(crash_path, sizeof crash_path, "%s", keys_path);
+    char *slash = strrchr(crash_path, '\\'), *fslash = strrchr(crash_path, '/');
     if (fslash > slash) slash = fslash;
-    snprintf(slash ? slash + 1 : path, sizeof path - (size_t)(slash ? slash + 1 - path : 0), "pipeline-crash.txt");
-    plat_crash_file(path);
-    FILE *f = fopen(path, "rb");
+    snprintf(slash ? slash + 1 : crash_path, sizeof crash_path - (size_t)(slash ? slash + 1 - crash_path : 0), "pipeline-crash.txt");
+    plat_crash_file(crash_path);
+    FILE *f = fopen(crash_path, "rb");
     if (!f) return;
     char *t = calloc(1, 1 << 16);
     size_t n = t ? fread(t, 1, (1 << 16) - 1, f) : 0;
@@ -2379,7 +2379,7 @@ static void crashed_open(const char *keys_path) {
     int lines = 0;
     for (size_t i = 0; i < n; i++) lines += t[i] == '\n';
     rt_log("vk_pipeline: %s: %d crash%s in the driver; those pipelines are built without optimization, or skipped after "
-           "a second crash", path, lines, lines == 1 ? "" : "es");
+           "a second crash", crash_path, lines, lines == 1 ? "" : "es");
 }
 static int crash_count(const char *note) {
     int n = 0;
@@ -2387,6 +2387,121 @@ static int crash_count(const char *note) {
     for (const char *at = crashed; at && (at = strstr(at, note)); at += len)
         n += (at == crashed || at[-1] == '\n') && (at[len] == '\n' || at[len] == '\r');
     return n;
+}
+// A compile stuck past the watchdog limit is remembered as too slow by appending its note twice to the same file the
+// crash handler writes, so the next run's crash_count sees two "crashes" and create_graphics skips the pipeline.
+static void vk_pipeline_note_slow(const char *note) {
+    if (!crash_path[0]) return;
+    FILE *f = fopen(crash_path, "a");
+    if (!f) return;
+    fprintf(f, "%s\n%s\n", note, note);
+    fclose(f);
+}
+
+static uint64_t qpc(void);
+static double ms_since(uint64_t t0);
+
+// LOCAL TEST (Ocarina): SPIR-V words from which a graphics pipeline is built without optimization on AMD: its compiler
+// spends minutes on a huge stage while every draw using it is skipped. TOTK_GFX_NOOPT_WORDS sets it, 0 turns it off.
+static uint64_t gfx_noopt_words(void) {
+    static uint64_t w = ~0ull;
+    if (w == ~0ull) {
+        const char *e = getenv("TOTK_GFX_NOOPT_WORDS");
+        w = e ? strtoull(e, NULL, 0) : 30000u;
+        if (!w) w = ~0ull - 1;
+    }
+    return w;
+}
+
+static uint64_t gfx_skip_words(void) {
+    static uint64_t w = ~0ull;
+    if (w == ~0ull) {
+        const char *e = getenv("TOTK_GFX_SKIP_WORDS");
+        w = e ? strtoull(e, NULL, 0) : 100000u;
+        if (!w) w = ~0ull - 1;
+    }
+    return w;
+}
+
+// LOCAL TEST (Ocarina): measured on an AMD iGPU, a fragment stage this large hangs the compiler for minutes; with a
+// mesh stage their sum does too. TOTK_GFX_SKIP_FS_WORDS and TOTK_GFX_SKIP_SUM_WORDS set them, 0 turns each rule off.
+static uint64_t gfx_skip_fs_words(void) {
+    static uint64_t w = ~0ull;
+    if (w == ~0ull) {
+        const char *e = getenv("TOTK_GFX_SKIP_FS_WORDS");
+        w = e ? strtoull(e, NULL, 0) : 60000u;
+        if (!w) w = ~0ull - 1;
+    }
+    return w;
+}
+
+static uint64_t gfx_skip_sum_words(void) {
+    static uint64_t w = ~0ull;
+    if (w == ~0ull) {
+        const char *e = getenv("TOTK_GFX_SKIP_SUM_WORDS");
+        w = e ? strtoull(e, NULL, 0) : 105000u;
+        if (!w) w = ~0ull - 1;
+    }
+    return w;
+}
+
+// LOCAL TEST (Ocarina): a big fragment stage with a big vertex stage hangs the compiler even without a mesh stage.
+// TOTK_GFX_SKIP_BOTH_FS_WORDS and TOTK_GFX_SKIP_BOTH_VS_WORDS set the two thresholds, 0 turns the rule off.
+static uint64_t gfx_skip_both_fs_words(void) {
+    static uint64_t w = ~0ull;
+    if (w == ~0ull) {
+        const char *e = getenv("TOTK_GFX_SKIP_BOTH_FS_WORDS");
+        w = e ? strtoull(e, NULL, 0) : 30000u;
+        if (!w) w = ~0ull - 1;
+    }
+    return w;
+}
+
+static uint64_t gfx_skip_both_vs_words(void) {
+    static uint64_t w = ~0ull;
+    if (w == ~0ull) {
+        const char *e = getenv("TOTK_GFX_SKIP_BOTH_VS_WORDS");
+        w = e ? strtoull(e, NULL, 0) : 50000u;
+        if (!w) w = ~0ull - 1;
+    }
+    return w;
+}
+
+// ---- graphics pipeline compiles in flight (the perf trace names them while they run)
+
+enum { ACTIVE_COMPILES = 16 };
+typedef struct {
+    volatile int32_t used;
+    volatile int32_t flagged;   // the watchdog found it running past TOTK_PIPE_STUCK_S
+    double start_ms;
+    char note[200];
+} ActiveCompile;
+static ActiveCompile active_compiles[ACTIVE_COMPILES];
+static PlatMutex active_compiles_lock = PLAT_MUTEX_INIT;
+
+static double now_ms(void);
+
+static int active_compile_claim(const char *note, double start_ms) {
+    int slot = -1;
+    plat_mutex_lock(&active_compiles_lock);
+    for (int i = 0; i < ACTIVE_COMPILES; i++) {
+        if (active_compiles[i].used) continue;
+        active_compiles[i].used = 1;
+        active_compiles[i].flagged = 0;
+        active_compiles[i].start_ms = start_ms;
+        snprintf(active_compiles[i].note, sizeof active_compiles[i].note, "%s", note);
+        slot = i;
+        break;
+    }
+    plat_mutex_unlock(&active_compiles_lock);
+    return slot;
+}
+
+static void active_compile_release(int slot) {
+    if (slot < 0) return;
+    plat_mutex_lock(&active_compiles_lock);
+    active_compiles[slot].used = 0;
+    plat_mutex_unlock(&active_compiles_lock);
 }
 
 static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Layout *l, uint32_t fs_off,
@@ -2592,6 +2707,7 @@ static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Lay
     }
     uint64_t p0 = perf_begin();
     static _Thread_local char note[200];   // named in the log if the driver crashes in this create (platform last-chance filter)
+    uint64_t vs_words = 0, fs_words = 0, gfx_words = 0;
     {
         const GfxShader *st[4] = {s->ts, s->vs, s->gs, s->fs};
         int at = snprintf(note, sizeof note, "graphics pipeline, mesh %d task %d:", mesh_vs(s), s->ts != NULL);
@@ -2599,11 +2715,42 @@ static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Lay
             uint64_t w = 0, h = 1469598103934665603ull;   // FNV-1a of the SPIR-V: the same shader across runs
             const uint32_t *c = st[i] ? gfx_shader_spirv(st[i], &w) : NULL;
             for (uint64_t j = 0; c && j < w; j++) h = (h ^ c[j]) * 1099511628211ull;
-            if (c) at += snprintf(note + at, sizeof note - at, " %s %llu words %016llx", (const char *[]){"ts", "vs", "gs", "fs"}[i],
-                                  (unsigned long long)w, (unsigned long long)h);
+            if (c) {
+                if (w > gfx_words) gfx_words = w;
+                if (i == 1) vs_words = w;
+                if (i == 3) fs_words = w;
+                at += snprintf(note + at, sizeof note - at, " %s %llu words %016llx", (const char *[]){"ts", "vs", "gs", "fs"}[i],
+                               (unsigned long long)w, (unsigned long long)h);
+            }
         }
     }
     int crashes = crash_count(note);
+    if (vk_caps.amd && gfx_words >= gfx_skip_words()) {
+        static volatile int32_t told;
+        if (plat_inc32(&told) <= 30)
+            rt_log("vk_pipeline: not built, a stage of %llu words is too large for this driver: %s",
+                   (unsigned long long)gfx_words, note);
+        goto out;
+    }
+    // LOCAL TEST (Ocarina): measured on an AMD iGPU, a fragment stage this large (or this combined with a mesh stage)
+    // hangs the driver's compiler for minutes on one CPU core per pipeline, so skip it before the compile slot is claimed.
+    if (vk_caps.amd &&
+        (fs_words >= gfx_skip_fs_words() || (mesh_vs(s) && vs_words + fs_words >= gfx_skip_sum_words()))) {
+        static volatile int32_t told;
+        if (plat_inc32(&told) <= 30)
+            rt_log("vk_pipeline: not built, stage sizes known to hang this driver (vs %llu words, fs %llu words): %s",
+                   (unsigned long long)vs_words, (unsigned long long)fs_words, note);
+        goto out;
+    }
+    // LOCAL TEST (Ocarina): measured on an AMD iGPU, a big fragment stage with a big vertex stage hangs the compiler
+    // for minutes even without a mesh stage, so skip it before the compile slot is claimed.
+    if (vk_caps.amd && fs_words >= gfx_skip_both_fs_words() && vs_words >= gfx_skip_both_vs_words()) {
+        static volatile int32_t told;
+        if (plat_inc32(&told) <= 30)
+            rt_log("vk_pipeline: not built, a big fragment stage with a big vertex stage hangs this driver (vs %llu words, fs %llu words): %s",
+                   (unsigned long long)vs_words, (unsigned long long)fs_words, note);
+        goto out;
+    }
     // A mesh pipeline that crashed amdvlk64.dll crashes it again without optimization; each crash kills the game.
     int amd_mesh = vk_caps.amd && mesh_vs(s) && crashes;
     if (crashes >= 2 || amd_mesh) {
@@ -2616,9 +2763,24 @@ static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Lay
         pi.flags |= VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;
         rt_log("vk_pipeline: built without optimization, the driver crashed in it before: %s", note);
     }
+    // LOCAL TEST (Ocarina): a huge graphics stage makes AMD's compiler run for minutes, and every draw using the
+    // pipeline is skipped until it returns; built without optimization as the compute path does with big_cs_words.
+    if (vk_caps.amd && !(pi.flags & VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT) && gfx_words >= gfx_noopt_words()) {
+        pi.flags |= VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;
+        static volatile int32_t told;
+        if (plat_inc32(&told) <= 20)
+            rt_log("vk_pipeline: built without optimization (%u words): %s", (unsigned)gfx_words, note);
+    }
     plat_crash_note(note);
     int shared = cache && cache == P.cache;
     if (shared) plat_mutex_lock_shared(&cache_access);
+    uint64_t t_built = qpc();
+    if (mesh_vs(s) || vs_words >= 20000 || fs_words >= 20000) {
+        static volatile int32_t told;
+        if (plat_inc32(&told) <= 80)
+            rt_log("vk_pipeline: compile start [%llu ms] %s", (unsigned long long)(qpc() / 1000000u), note);
+    }
+    int compile_slot = active_compile_claim(note, now_ms());
     VkResult r = vkCreateGraphicsPipelines(P.device, cache, 1, &pi, NULL, &pipe);
     // AMD's compiler gives up on large programs (-1, out of host memory, on an RX 6750 XT: the scene stayed black at
     // 1 fps). Built again without optimization, as NotRexed/Hookshot's RX_VK_NOOPT does; NVIDIA never gets here.
@@ -2626,6 +2788,14 @@ static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Lay
         pi.flags |= VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;
         r = vkCreateGraphicsPipelines(P.device, cache, 1, &pi, NULL, &pipe);
         rt_log("vk_pipeline: graphics pipeline built again without optimization: %s", r == VK_SUCCESS ? "ok" : "failed too");
+    }
+    active_compile_release(compile_slot);
+    double built_ms = ms_since(t_built);
+    if (built_ms > 1000.0 || mesh_vs(s)) {
+        static volatile int32_t told;
+        if (plat_inc32(&told) <= 120)
+            rt_log("vk_pipeline: graphics pipeline built in %.1f s (%s): %s", built_ms / 1000.0,
+                   mesh_vs(s) ? "mesh" : "vertex", note);
     }
     if (shared) plat_mutex_unlock_shared(&cache_access);
     plat_crash_note(NULL);
@@ -3018,7 +3188,7 @@ typedef struct Job {
     GKey k;
 } Job;
 
-#define MAX_WORKERS 4
+#define MAX_WORKERS 12
 
 static struct {
     int on;                            // set once by vk_pipeline_async_enable, before the replay runs
@@ -3281,6 +3451,11 @@ static void pipe_worker(void *arg) {
             }
         }
         plat_mutex_unlock(&P.lock);
+        if (j->large) {
+            static volatile int32_t told;
+            if (plat_inc32(&told) <= 20)
+                rt_log("vk_pipeline: worker %d starts a large graphics pipeline", me);
+        }
         // As with the big compute worker, do not hold the shared driver
         // cache during a large compilation.
         VkPipelineCache own = j->large ? cache_private() : VK_NULL_HANDLE;
@@ -3316,6 +3491,68 @@ static void pipe_worker(void *arg) {
     return;
 }
 
+// One small watchdog thread, started with the pool: a graphics compile on AMD can run for many minutes and never finish;
+// a few stuck ones occupy the pool and the low-queue limit (A.low_running < A.threads - 1) then starves every other job.
+// The watchdog flags each stuck compile, remembers it as too slow (next run skips it) and adds a worker so the rest run.
+static volatile int watchdog_stop;   // set by workers_drain; the watchdog checks it every 5 s
+
+static int pipe_stuck_s(void) {      // TOTK_PIPE_STUCK_S: seconds a compile may run before it is stuck; 0 disables
+    static int s = -1;
+    if (s < 0) {
+        const char *e = getenv("TOTK_PIPE_STUCK_S");
+        s = e ? atoi(e) : 90;
+    }
+    return s;
+}
+
+// Starts one more pool worker (pipe_worker) so queued jobs run while others are stuck, up to MAX_WORKERS. Caller holds P.lock.
+static int worker_add(void) {
+    if (A.threads >= MAX_WORKERS) return 0;
+    int me = A.threads;
+    PlatThread *t = plat_thread_new(pipe_worker, (void *)(intptr_t)me, "pipe worker");
+    if (!t) return 0;
+    A.thread[me] = t;
+    A.prio_low[me] = 0;
+    A.threads++;
+    plat_cond_broadcast(&work_cv);   // A.threads - 1 grew, so a sleeping worker may now take low-queue work
+    return 1;
+}
+
+static void pipe_watchdog(void *arg) {
+    (void)arg;
+    int stuck_s = pipe_stuck_s();
+    if (stuck_s <= 0) return;   // 0 disables the watchdog
+    for (;;) {
+        plat_sleep_ms(5000);
+        if (watchdog_stop) return;
+        double now = now_ms();
+        char note[ACTIVE_COMPILES][200];
+        double sec[ACTIVE_COMPILES];
+        int n = 0;
+        plat_mutex_lock(&active_compiles_lock);
+        for (int i = 0; i < ACTIVE_COMPILES; i++) {
+            ActiveCompile *c = &active_compiles[i];
+            if (!c->used || c->flagged) continue;
+            double s = (now - c->start_ms) / 1000.0;
+            if (s < (double)stuck_s) continue;
+            c->flagged = 1;
+            snprintf(note[n], sizeof note[n], "%s", c->note);
+            sec[n] = s;
+            n++;
+        }
+        plat_mutex_unlock(&active_compiles_lock);
+        for (int i = 0; i < n; i++) {
+            vk_pipeline_note_slow(note[i]);
+            static volatile int32_t told;
+            if (plat_inc32(&told) <= 30)
+                rt_log("vk_pipeline: compile stuck for %.0f s, remembered as too slow: %s", sec[i], note[i]);
+            plat_mutex_lock(&P.lock);
+            worker_add();
+            plat_mutex_unlock(&P.lock);
+        }
+    }
+}
+
 // Starts the pool on first use: a quarter of the logical processors, 2 to 4. Caller holds P.lock.
 static int workers_start(void) {
     if (A.threads) return 1;
@@ -3326,12 +3563,18 @@ static int workers_start(void) {
         if (!t) break;
         A.thread[A.threads++] = t;   // kept: promote() raises a worker running a prebuild job
     }
-    if (A.threads) rt_log("vk_pipeline: %d background graphics pipeline workers", A.threads);
-    else rt_log("vk_pipeline: cannot start pipeline workers; building synchronously");
+    if (A.threads) {
+        rt_log("vk_pipeline: %d background graphics pipeline workers", A.threads);
+        if (!plat_thread_new(pipe_watchdog, NULL, "pipe watchdog"))
+            rt_log("vk_pipeline: cannot start the compile watchdog");
+    } else {
+        rt_log("vk_pipeline: cannot start pipeline workers; building synchronously");
+    }
     return A.threads != 0;
 }
 
 static void workers_drain(void) {
+    watchdog_stop = 1;   // the compile watchdog checks this every 5 s and exits
     plat_mutex_lock(&P.lock);
     K.loading = 0;
     for (Job *j = A.low, *n; j; j = n) {   // queued prebuild jobs are dropped, not built
@@ -4403,6 +4646,48 @@ void vk_pipeline_set_dynamic(VkCommandBuffer cb, const VkPipeState *s) {
 }
 
 // ---- statistics, persistence, teardown
+
+int vk_pipeline_queue_status(char *out, size_t cap) {
+    plat_mutex_lock_shared(&P.lock);
+    if (!A.on || !A.threads) {
+        plat_mutex_unlock_shared(&P.lock);
+        return 0;
+    }
+    int normal = 0, low = 0, large = 0, building = 0;
+    for (const Job *j = A.head; j; j = j->next) normal++;
+    for (const Job *j = A.low; j; j = j->next) {
+        low++;
+        if (j->large) large++;
+    }
+    for (int i = 0; i < PIPE_BUCKETS; i++)
+        for (const Pipe *p = pipes[i]; p; p = p->next)
+            if (p->building && !p->info.pipeline) building++;
+    int n = snprintf(out, cap, "queue: normal %d low %d (large %d) running-low %d inflight %d workers %d pipes-building %d",
+                     normal, low, large, A.low_running, (int)A.inflight, A.threads, building);
+    double starts[ACTIVE_COMPILES];
+    char notes[ACTIVE_COMPILES][200];
+    size_t active = 0;
+    plat_mutex_lock(&active_compiles_lock);
+    for (int i = 0; i < ACTIVE_COMPILES; i++) {
+        if (!active_compiles[i].used) continue;
+        starts[active] = active_compiles[i].start_ms;
+        memcpy(notes[active], active_compiles[i].note, sizeof notes[active]);
+        active++;
+    }
+    plat_mutex_unlock(&active_compiles_lock);
+    plat_mutex_unlock_shared(&P.lock);
+    size_t used = n < 0 ? 0 : (size_t)n < cap ? (size_t)n : cap ? cap - 1 : 0;
+    for (size_t i = 0; i < active && used + 1 < cap; i++) {
+        double secs = (now_ms() - starts[i]) / 1000.0;
+        if (secs < 0) secs = 0;
+        int w = snprintf(out + used, cap - used, " | running %.0f s: %s", secs, notes[i]);
+        if (w > 0) {
+            size_t room = cap - used;
+            used += (size_t)w < room ? (size_t)w : room - 1;
+        }
+    }
+    return (int)used;
+}
 
 void vk_pipeline_stats(VkPipeStats *s) {
     plat_mutex_lock_shared(&P.lock);

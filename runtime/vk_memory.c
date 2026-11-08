@@ -1397,6 +1397,7 @@ static void dirty_frame(uint64_t frame) {
 enum { MR_BUDGET, MR_UNTRACKED, MR_OVERLAP, MR_ALLOC, MR_N };
 
 int vk_mirror_on;
+static int mem_uma;                    // device class uma (vk_mem_class_log), not the mirror mode
 static int mirror_verify;
 static int mirror_gap = 2;             // pre-snap: hot pools at most this many 2 MiB regions apart share one query
 static PoolRec **mlist;                // pool_lock: mirrored pools by import_lo
@@ -2085,6 +2086,7 @@ void vk_mem_class_log(const VkPhysicalDeviceProperties *p, const VkPhysicalDevic
     else if (host_heap < 0) cls = "uma", why = "every heap is device-local";
     else cls = "discrete", why = "device-local heap separate from host memory";
     int discrete = cls[0] == 'd';
+    mem_uma = !discrete;
     char line[2048];
     size_t k = (size_t)snprintf(line, sizeof line, "mem: class %s (%s; device type %d %s, %s)", cls, why, t, tn, p->deviceName);
     for (uint32_t h = 0; h < m->memoryHeapCount; h++)
@@ -2283,34 +2285,54 @@ void vk_upload_end(void) { plat_rmutex_unlock(&cmd_lock); }
 // the headroom thread (vk_headroom.c) or a burst of uploads held every staging allocation of the render thread: one
 // took 47-50 ms, for a few bytes, in the first frame after a save load. Larger buffers than a block go to the default
 // pool.
+// On a UMA device the host and device-local heaps are the same RAM, and staging through the host heap makes the GPU
+// read a second copy: the pool keeps a single, smaller 32 MiB block (minBlockCount 0 or 1, as the code below sets),
+// takes a DEVICE_LOCAL|HOST_VISIBLE type when VMA offers one, and VMA releases empty blocks.
 #define STG_BLOCK (64ull << 20)
+#define STG_UMA_BLOCK (32ull << 20)
 #define STG_MIN_BLOCKS 2
 static VmaPool stg_pool;
 static int stg_pool_tried;
+static VkDeviceSize stg_block = STG_BLOCK;   // block size the pool was built with
+static uint32_t stg_frame;
+
+// The device class is uma (vk_mem_class_log), or the device itself reports integrated (the detection vk_mem_vram uses).
+static int stg_uma(VkCtx *c) {
+    return mem_uma || (c && c->props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU);
+}
 
 void *vk_staging(VkDeviceSize size, VkBuffer *buf, VmaAllocation *alloc) {
     VkCtx *c = vk_ctx();
+    int uma = stg_uma(c);
+    VkDeviceSize block = uma ? STG_UMA_BLOCK : STG_BLOCK;
     VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = size ? size : 16,
                              .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT};
     VmaAllocationCreateInfo aci = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
                                    .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT};
+    if (uma) {
+        // Required for the mapping below; device-local preferred so the GPU reads the staging bytes in place.
+        aci.requiredFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
+        aci.preferredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+    }
     if (!__atomic_load_n(&stg_pool_tried, __ATOMIC_ACQUIRE)) {
         plat_once(&cmd_once, cmd_init, NULL);
         plat_rmutex_lock(&cmd_lock);
         if (!stg_pool_tried) {
             uint32_t type;
-            VmaPoolCreateInfo pi = {.blockSize = STG_BLOCK, .minBlockCount = STG_MIN_BLOCKS};
+            VmaPoolCreateInfo pi = {.blockSize = block, .minBlockCount = uma ? 1 : STG_MIN_BLOCKS};
             if (vmaFindMemoryTypeIndexForBufferInfo(c->vma, &bi, &aci, &type) == VK_SUCCESS) {
                 pi.memoryTypeIndex = type;
                 if (vmaCreatePool(c->vma, &pi, &stg_pool) != VK_SUCCESS) stg_pool = NULL;
             }
-            rt_log("vk: staging pool %s (%d blocks of %llu MiB kept)", stg_pool ? "created" : "unavailable: default pool",
-                   STG_MIN_BLOCKS, (unsigned long long)(STG_BLOCK >> 20));
+            stg_block = block;
+            rt_log("vk: staging pool %s (%d block%s of %llu MiB%s)", stg_pool ? "created" : "unavailable: default pool",
+                   uma ? 1 : STG_MIN_BLOCKS, uma ? "" : "s", (unsigned long long)(block >> 20),
+                   uma ? ", idle blocks freed after use" : "");
             __atomic_store_n(&stg_pool_tried, 1, __ATOMIC_RELEASE);
         }
         plat_rmutex_unlock(&cmd_lock);
     }
-    if (stg_pool && bi.size <= STG_BLOCK / 2) aci.pool = stg_pool;
+    if (stg_pool && bi.size <= stg_block / 2) aci.pool = stg_pool;
     VmaAllocationInfo info;
     VkBuffer b;
     VmaAllocation a;
@@ -2348,6 +2370,8 @@ uint64_t vk_upload_flush(int wait) {
         }
         if (ninflight == cap_inflight) grow((void **)&inflight, &cap_inflight, sizeof *inflight);
         inflight[ninflight++] = open_b;
+        // One staging "frame" per batch: an UMA block left empty is freed once a later allocation sees it idle.
+        if (stg_uma(c)) vmaSetCurrentFrameIndex(c->vma, ++stg_frame);
         open_active = 0;
     }
     if (c && wait) {
@@ -2450,6 +2474,8 @@ void vk_mem_shutdown(void) {
     if (stg_pool) vmaDestroyPool(c->vma, stg_pool);   // after retire: no staging buffer is left in it
     stg_pool = NULL;
     stg_pool_tried = 0;
+    stg_block = STG_BLOCK;
+    stg_frame = 0;
     plat_rmutex_unlock(&cmd_lock);
     plat_mutex_lock(&pool_lock);
     for (int i = 0; i < pool_index.n; i++) destroy_rec(c, pool_index.e[i].buf);

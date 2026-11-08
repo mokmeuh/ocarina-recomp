@@ -12,6 +12,7 @@
 #include "nvn_mode_trace.h"
 #include "perfmon.h"
 #include "prof.h"
+#include "vk.h"
 #include "platform/platform.h"
 
 volatile uint32_t prof_render_tid, prof_main_tid, prof_replay_tid;
@@ -322,6 +323,9 @@ void perf_present(uint64_t frame) {
                (unsigned long long)shader_keys, (unsigned long long)shader_xlated,
                (span > wait_ns[PERF_PACE] ? span - wait_ns[PERF_PACE] : 0) / 1e6 / n,
                plat_xchg64(&replay_ns, 0) / 1e6 / n, (unsigned long long)ab_b, (unsigned long long)n, frame_step_world_us() / 1e6);
+    char pipeline[1500];
+    if (vk_pipeline_queue_status(pipeline, sizeof pipeline) > 0)
+        rt_log("perf: frame %llu: pipeline %s", (unsigned long long)frame, pipeline);
     if (n && span) perf_gpu_line(frame, sum / 1e6 / n, (double)wait_ns[PERF_PACE] / span, n);
     sum = max = n = ab_b = 0;
     memset(wait_ns, 0, sizeof wait_ns);
