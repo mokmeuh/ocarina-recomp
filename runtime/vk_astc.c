@@ -365,7 +365,10 @@ int vk_astc_mode(void) {
             m = want == VK_ASTC_CPU ? VK_ASTC_CPU : want == VK_ASTC_CHECK ? VK_ASTC_CHECK : VK_ASTC_GPU;
             // auto on an integrated GPU: the CPU. On an Intel Arc 140V the first load of Kokiri Forest decoded about
             // 780 million texels on the GPU in one go and the device was lost (past Windows' 2 s TDR); on the CPU it loads.
-            if (want == -1 && c->props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU) m = VK_ASTC_CPU;
+            // AMD integrated GPUs (Radeon Graphics, vendor 0x1002) decode on the GPU without a TDR and run at ~54 fps
+            // there; the CPU path left them at 2 fps with 400 ms fence waits per frame.
+            if (want == -1 && c->props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU && c->props.vendorID != 0x1002)
+                m = VK_ASTC_CPU;
         }
         if ((m == VK_ASTC_GPU || m == VK_ASTC_CHECK || m == VK_ASTC_NATIVE) && !G.pipe && !G.failed &&
             !create_pipeline(c)) {
