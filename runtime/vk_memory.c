@@ -765,7 +765,36 @@ void vk_mem_census(uint64_t frame) {
     window_start = frame;
 }
 
+static int vram_raw(uint64_t *used, uint64_t *budget, int *exact);
+
+// On an integrated GPU the device-local heap is system RAM, and the guest's own memory (5-10 GiB here) comes out of the
+// same RAM: an 8 GiB "heap" on a 24 GiB machine left Windows 444 MiB free after six minutes, 16 images failed with
+// out-of-memory and the AMD driver crashed (amdvlk64.dll, access violation) compiling a pipeline. The budget is capped at
+// what the machine can still give: the heap in use plus the free physical memory less a reserve for the system, so the
+// pressure sweep (vk_texture.c) and the mirror check start releasing before RAM is gone.
 int vk_mem_vram(uint64_t *used, uint64_t *budget, int *exact) {
+    if (!vram_raw(used, budget, exact)) return 0;
+    VkCtx *c = vk_ctx();
+    if (c->props.deviceType != VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU) return 1;
+    float used_mb = 0, total_mb = 0, proc_mb = 0;
+    plat_mem_info(&used_mb, &total_mb, &proc_mb);
+    if (total_mb <= 0) return 1;
+    uint64_t total = (uint64_t)total_mb << 20, free_ram = total > ((uint64_t)used_mb << 20) ? total - ((uint64_t)used_mb << 20) : 0;
+    uint64_t reserve = total / 8 > (2ull << 30) ? total / 8 : 2ull << 30;
+    uint64_t cap = *used + free_ram > reserve ? *used + free_ram - reserve : 1;
+    static int logged;
+    if (cap < *budget) {
+        if (!logged) {
+            logged = 1;
+            rt_log("mem: integrated gpu: the heap budget %.0f MiB is capped to %.0f MiB by free system memory (%.0f MiB free, %.0f MiB kept for the system)",
+                   *budget / 1048576.0, cap / 1048576.0, free_ram / 1048576.0, reserve / 1048576.0);
+        }
+        *budget = cap;
+    }
+    return 1;
+}
+
+static int vram_raw(uint64_t *used, uint64_t *budget, int *exact) {
     VkCtx *c = vk_ctx();
     *used = *budget = 0, *exact = 0;
     if (!c) return 0;
