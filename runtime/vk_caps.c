@@ -80,7 +80,8 @@ void vk_caps_init(VkCtx *c) {
     VkPhysicalDeviceLimits *l = &c->props.limits;
     VkPhysicalDeviceDriverProperties drv = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
     VkPhysicalDeviceSubgroupProperties sg = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES, .pNext = &drv};
-    VkPhysicalDeviceVulkan13Properties p13 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_PROPERTIES, .pNext = &sg};
+    VkPhysicalDeviceFloatControlsProperties fc = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FLOAT_CONTROLS_PROPERTIES, .pNext = &sg};
+    VkPhysicalDeviceVulkan13Properties p13 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_PROPERTIES, .pNext = &fc};
     VkPhysicalDevicePushDescriptorPropertiesKHR pd = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PUSH_DESCRIPTOR_PROPERTIES_KHR,
                                                       .pNext = &p13};
     VkPhysicalDeviceProperties2 p2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &pd};
@@ -115,6 +116,17 @@ void vk_caps_init(VkCtx *c) {
     gfx_shader_set_host(vk_caps.float64, vk_caps.sbuf_align, told, gather);
     uint32_t geometry_told = vk_caps.sg_pin_stages & VK_SHADER_STAGE_GEOMETRY_BIT ? want : sg.subgroupSize;
     gfx_shader_set_geometry_host(geometry_told);
+    // TOTK_FLOAT_CONTROLS=0/1 forces the NaN/infinity/signed-zero execution modes off or on (gfx_shader.c
+    // spirv_float_controls); unset: on for AMD, where the compiler otherwise assumes finite values, off elsewhere.
+    const char *fe = cfg_get("TOTK_FLOAT_CONTROLS");
+    int fc_want = fe && *fe ? strcmp(fe, "0") != 0 : vk_caps.amd;
+    vk_caps.float_controls = fc_want && fc.shaderSignedZeroInfNanPreserveFloat32;
+    gfx_shader_set_float_controls(vk_caps.float_controls, vk_caps.float_controls && vk_caps.float64 &&
+                                                              fc.shaderSignedZeroInfNanPreserveFloat64);
+    rt_log("vk caps: float controls: signed zero/inf/NaN preserve fp32 %d fp64 %d, denorm preserve fp32 %d: modules %s",
+           (int)fc.shaderSignedZeroInfNanPreserveFloat32, (int)fc.shaderSignedZeroInfNanPreserveFloat64,
+           (int)fc.shaderDenormPreserveFloat32, vk_caps.float_controls ? "declare SignedZeroInfNanPreserve (TOTK_FLOAT_CONTROLS=0 turns it off)"
+                                                                       : "keep the translator's declarations");
     if (gather) rt_log("vk caps: gather coordinates biased for %u sub-texel bits (TOTK_GATHER_BIAS)", gather);
 
     char dv[32];

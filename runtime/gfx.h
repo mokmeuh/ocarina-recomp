@@ -66,6 +66,9 @@ void gfx_shader_counts(uint64_t *keys, uint64_t *translated);   // distinct keys
 void gfx_shader_set_host(int float64, uint32_t sbuf_align, const uint32_t subgroup[3], uint32_t gather_bits);
 // Both host setters precede shader requests. GS has no subgroup default; repeated identical setup is harmless.
 void gfx_shader_set_geometry_host(uint32_t subgroup);
+// SignedZeroInfNanPreserve execution modes added to the modules in memory (vk_caps.c, TOTK_FLOAT_CONTROLS): 32-bit floats
+// when sz_inf_nan_preserve, 64-bit ones too when also_float64. 0, 0 leaves the modules as the translator wrote them.
+void gfx_shader_set_float_controls(int sz_inf_nan_preserve, int also_float64);
 const uint8_t *gfx_shader_key(const GfxShader *s);          // the 32-byte cache key (stable while the translator is)
 const uint8_t *gfx_shader_input_id(const GfxShader *s);     // the 32-byte input id (stable across translators)
 // By input id from memory or disk; xlate 1 also translates it from its stored inputs. NULL if absent.

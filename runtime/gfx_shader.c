@@ -599,6 +599,85 @@ static int spirv_complete(const uint32_t *w, uint64_t n) {
     return i == n;
 }
 
+// SPIR-V float controls. The translator declares no execution mode for NaN, infinity or the sign of zero, so a driver may
+// assume there are none: AMD's compiler (LLPC) then simplifies the min/max/clamp/compare/select chains and the divisions
+// of Maxwell code as if every value were finite, where NVIDIA's keeps IEEE results (a division by zero that a saturate
+// brings back to 1 can come out as garbage or as 0; the logged symptom is blown-out highlights and flat white or black
+// shapes). Where the device reports shaderSignedZeroInfNanPreserve (vk_caps.c) every module except a geometry shader gets
+// the capability, SPV_KHR_float_controls (before SPIR-V 1.4) and OpExecutionMode SignedZeroInfNanPreserve 32 on each entry
+// point (64 as well for a module that declares Float64). Applied to the words in memory after the cache read, so the files
+// and the cache keys stay as the translator made them.
+static int fc_on, fc_f64;
+
+void gfx_shader_set_float_controls(int sz_inf_nan_preserve, int also_float64) {
+    fc_on = sz_inf_nan_preserve, fc_f64 = also_float64;
+}
+
+enum { SPV_OP_EXTENSION = 10, SPV_OP_EXT_INST_IMPORT = 11, SPV_OP_MEMORY_MODEL = 14, SPV_OP_ENTRY_POINT = 15,
+       SPV_OP_EXECUTION_MODE = 16, SPV_OP_CAPABILITY = 17, SPV_OP_EXECUTION_MODE_ID = 331,
+       SPV_CAP_FLOAT64 = 10, SPV_CAP_SZINP = 4466, SPV_EM_SZINP = 4461, SPV_VERSION_1_4 = 0x00010400 };
+
+static void spirv_float_controls(GfxShader *s) {
+    static const char ext_name[] = "SPV_KHR_float_controls";
+    const uint32_t *w = s->spirv;
+    uint64_t n = s->words, i = 5;
+    if (n < 5 || w[0] != 0x07230203) return;
+    int has_cap = 0, has_ext = 0, f64 = 0;
+    while (i < n && (w[i] & 0xffff) == SPV_OP_CAPABILITY && (w[i] >> 16) >= 2) {   // the capabilities open the module
+        if (w[i + 1] == SPV_CAP_SZINP) has_cap = 1;
+        else if (w[i + 1] == SPV_CAP_FLOAT64) f64 = 1;
+        i += w[i] >> 16;
+    }
+    uint64_t cap_end = i;
+    while (i < n && (w[i] & 0xffff) == SPV_OP_EXTENSION && (w[i] >> 16) >= 2) {
+        if (((w[i] >> 16) - 1) * 4 >= sizeof ext_name && !memcmp(w + i + 1, ext_name, sizeof ext_name)) has_ext = 1;
+        i += w[i] >> 16;
+    }
+    uint64_t ext_end = i;
+    while (i < n && ((w[i] & 0xffff) == SPV_OP_EXT_INST_IMPORT || (w[i] & 0xffff) == SPV_OP_MEMORY_MODEL) && (w[i] >> 16))
+        i += w[i] >> 16;
+    uint32_t entry[8];
+    int ne = 0, has_mode = 0;
+    while (i < n && (w[i] >> 16)) {   // entry points, then their execution modes
+        uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
+        if (op == SPV_OP_ENTRY_POINT && len >= 4) {
+            if (ne < 8) entry[ne] = w[i + 2];
+            ne++;
+        } else if ((op == SPV_OP_EXECUTION_MODE || op == SPV_OP_EXECUTION_MODE_ID) && len >= 3) {
+            if (w[i + 2] == SPV_EM_SZINP) has_mode = 1;
+        } else {
+            break;
+        }
+        i += len;
+    }
+    uint64_t modes_end = i;
+    if (!ne || ne > 8 || has_mode || modes_end > n) return;
+    int widths = f64 && fc_f64 ? 2 : 1;
+    uint32_t ext_words = (uint32_t)((sizeof ext_name + 3) / 4);
+    uint64_t add_cap = has_cap ? 0 : 2, add_ext = has_ext || w[1] >= SPV_VERSION_1_4 ? 0 : 1 + ext_words;
+    uint64_t total = n + add_cap + add_ext + (uint64_t)ne * (uint64_t)widths * 4;
+    uint32_t *o = malloc(total * sizeof *o);
+    if (!o) return;
+    uint64_t k = 0;
+    memcpy(o, w, cap_end * sizeof *o), k = cap_end;
+    if (add_cap) o[k++] = 2u << 16 | SPV_OP_CAPABILITY, o[k++] = SPV_CAP_SZINP;
+    memcpy(o + k, w + cap_end, (ext_end - cap_end) * sizeof *o), k += ext_end - cap_end;
+    if (add_ext) {
+        o[k++] = (1 + ext_words) << 16 | SPV_OP_EXTENSION;
+        memset(o + k, 0, ext_words * sizeof *o);
+        memcpy(o + k, ext_name, sizeof ext_name);
+        k += ext_words;
+    }
+    memcpy(o + k, w + ext_end, (modes_end - ext_end) * sizeof *o), k += modes_end - ext_end;
+    for (int e = 0; e < ne; e++)
+        for (int j = 0; j < widths; j++) {
+            o[k++] = 4u << 16 | SPV_OP_EXECUTION_MODE, o[k++] = entry[e], o[k++] = SPV_EM_SZINP, o[k++] = j ? 64 : 32;
+        }
+    memcpy(o + k, w + modes_end, (n - modes_end) * sizeof *o), k += n - modes_end;
+    free(s->spirv);
+    s->spirv = o, s->words = k;
+}
+
 // Reads <key>.spv and <key>.res.json from the pack (packed 1) or the loose files; NULL if either is missing or
 // malformed. iid: the input id, NULL when the caller sets it.
 static GfxShader *disk_load_from(const uint8_t key[32], const uint8_t *iid, int packed, int flags) {
@@ -631,6 +710,7 @@ static GfxShader *disk_load_from(const uint8_t key[32], const uint8_t *iid, int 
     s->reflection = (char *)res;
     s->reflection_size = res_size;
     if (!reflect(s, flags)) { shader_free(s); return NULL; }
+    if (fc_on && s->stage != GFX_STAGE_GS) spirv_float_controls(s);
     return s;
 }
 
