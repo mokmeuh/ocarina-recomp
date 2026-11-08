@@ -10,9 +10,9 @@ Input comes from the first SDL3 gamepad, the keyboard and the mouse, merged into
 - `nintendo`: by position, as on a Switch (the table below).
 - `xbox`: south A, east B, west X, north Y, as an Xbox pad labels them; on a PlayStation pad cross is A, circle B, square X, triangle Y.
 - `auto` (default): `nintendo` for a pad whose east button SDL reports labelled A (Switch Pro Controller, Nintendo-layout pads), `xbox` for the others.
-- `xbox_prompts`: the buttons as `nintendo`, and the game's prompts name the Xbox labels (see Xbox button prompts below).
+- `xbox_prompts`: the buttons as `xbox`, and the action prompt's diamond drawn in the Xbox positions (see Xbox button prompts below).
 
-The log names the layout in effect (`input: gamepad layout ...`); the menu shows it under *Automatic*. With `nintendo`, `xbox` and `auto` the game's button prompts stay Switch letters; `xbox_prompts` changes them.
+The log names the layout in effect (`input: gamepad layout ...`); the menu shows it under *Automatic*. With `nintendo`, `xbox` and `auto` the game's button prompts keep the Switch positions (A right, B bottom, X top, Y left); `xbox_prompts` moves the action prompt's diamond.
 
 | Switch | Gamepad (by position, Nintendo layout) | Keyboard and mouse | Action in the world |
 |---|---|---|---|
@@ -36,16 +36,18 @@ Esc is unbound in the game; it opens the settings menu and releases the mouse cu
 
 ## Xbox button prompts
 
-`pad_layout = xbox_prompts` (*Xbox prompts (A right)* on the Controls tab) is for an Xbox pad played by position. The buttons work as with `nintendo`: the right button, labelled B, does Switch A (interact, confirm), and the bottom one, labelled A, does Switch B (run, cancel). The letters the game shows are swapped to match the labels, A with B and X with Y, so each prompt names the button to press. The other layouts leave the prompts alone: with `xbox` the Switch letters already match the labels.
+`pad_layout = xbox_prompts` (*Xbox prompts* on the Controls tab) is for an Xbox pad played by position. The buttons work as with `xbox`: the bottom button does Switch A, the right one B, the left one X and the top one Y. The game's prompts show the same letters as always (A is still shown as A); the overlay only moves where the action prompt's diamond (layout `DoCommand_00`) puts them: A at the bottom, B right, X left, Y top, as on the pad. No letter is swapped and no font glyph is touched. The other layouts leave the diamond in the Switch positions (A right, B bottom, X top, Y left).
 
-The swapped letters are part of the game's textures, fonts and messages, so they follow the layout and not the bindings. A button remapped with a `bind_` line or on the Controls tab keeps the letter the game draws for it, and the prompt then names the wrong button. Use `xbox_prompts` with the default bindings.
+The diamond's positions are part of the game's UI archive, so they follow the layout and not the bindings. A button remapped with a `bind_` line or on the Controls tab keeps the position the diamond draws for it, and the prompt then points at the wrong button. Use `xbox_prompts` with the default bindings.
 
-The buttons change at once, but the game reads its UI archive and fonts once at boot, so the prompts change at the next start (the menu says *prompts change after restart*). `xbox_prompts` loads `romfs-patches-xbox` next to `romfs-index.bin` in place of `romfs-patches` (`runtime/romfs.c`, `overlay_init`): the same 60 fps patches, with the swap made from the game's own files by `tools/make_romfs_patches.py --xbox-prompts`, which the setup runs next to the plain one:
+The buttons change at once, but the game reads its UI archive once at boot, so the diamond changes at the next start (the menu says *prompts change after restart*). `xbox_prompts` loads `romfs-patches-xbox` next to `romfs-index.bin` in place of `romfs-patches` (`runtime/romfs.c`, `overlay_init`). The overlay is generated from the player's own RomFS by `tools/oot/make_xbox_prompts.py` into `build/oot111/romfs-patches-xbox` (derived from the game, never committed). In `Common.Product.100.Nin_Ounce_NVN2.blarc.zs` it changes only the `DoCommand_00` layout:
 
-- the action prompt (`DoCommand_00`) draws the letter images `Nt_KeyTexA/B/X/Y_00`, whose image data is swapped, in a diamond that names the other face buttons. The diamond's letters are text the game takes from `LayoutMsg/DoCommand_00.msbt` of each language's `Mals` archive (and the layout's own text panes behind it); both are swapped. The diamond's shape shows the button's position and stays.
-- every other prompt is text in the button font (`scft/External.bfotf` in each `Font/Font*.Nin_NX_NVN.bfarc.zs`, glyphs U+E040 to U+E043); the A and B, X and Y glyphs are swapped.
+- the pane positions: the other three face buttons of each variant (the prompt of A, B, X or Y) sit on the arms of the diamond, and every position (x, y) becomes (-y, -x), so A moves from right to bottom, B from bottom to right, X from top to left and Y from left to top.
+- the silhouette textures behind the buttons (`DoCommandCrossBase_A_00` and `_B_00`, with their gradients) are exchanged, with their scales, so the shape follows the highlighted button.
 
-Without the folder (an install made by an older setup, or one where the setup could not prepare it and showed a warning) the menu says the files are missing, the log has `RomFS overlay: pad_layout = xbox_prompts, but ...`, and the Switch prompts stay; running the setup again on the install folder writes it. In a source build, `.venv-py314\Scripts\python tools\make_romfs_patches.py --version <ver> --xbox-prompts` writes `build\<ver>\romfs-patches-xbox`.
+The ocarina notes, the controller picture and the button-letter glyphs and textures are left as the game has them.
+
+Without the folder the menu says the files are missing, the log has `RomFS overlay: pad_layout = xbox_prompts, but ...`, and the Switch positions stay. In a source build, run `tools/oot/make_xbox_prompts.py` with the embedded Python (3.14) after the RomFS is extracted to `build/romfs`.
 
 ## Window keys
 
