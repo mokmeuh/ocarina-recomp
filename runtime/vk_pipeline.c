@@ -2872,7 +2872,7 @@ typedef struct Job {
     GKey k;
 } Job;
 
-#define MAX_WORKERS 4
+#define MAX_WORKERS 8
 
 static struct {
     int on;                            // set once by vk_pipeline_async_enable, before the replay runs
@@ -3147,11 +3147,13 @@ static void pipe_worker(void *arg) {
     return;
 }
 
-// Starts the pool on first use: a quarter of the logical processors, 2 to 4. Caller holds P.lock.
+// Starts the pool on first use: a quarter of the logical processors, 2 to 4 (on AMD, where a pipeline
+// compile takes ~1 s, half of them, 2 to 8). Caller holds P.lock.
 static int workers_start(void) {
     if (A.threads) return 1;
     uint32_t cpus = plat_cpu_usable();
-    int n = cpus / 4 < 2 ? 2 : cpus / 4 > MAX_WORKERS ? MAX_WORKERS : (int)(cpus / 4);
+    uint32_t div = vk_caps.amd ? 2 : 4, cap = vk_caps.amd ? 8 : 4;
+    int n = cpus / div < 2 ? 2 : cpus / div > cap ? (int)cap : (int)(cpus / div);
     for (int i = 0; i < n; i++) {
         PlatThread *t = plat_thread_new(pipe_worker, (void *)(intptr_t)A.threads, "pipe worker");
         if (!t) break;
