@@ -1000,6 +1000,138 @@ static uint32_t *spirv_add_outputs(const uint32_t *w, uint64_t n, uint32_t missi
     return o;
 }
 
+// Rewrites the fragment Input variables at the Locations `missing` as Private, initialised as Maxwell reads an unwritten
+// output: (0, 0, 0, 1) for a vec4, zeros otherwise (a mesh stage leaves the matching Outputs undeclared, and AMD's
+// compiler crashes on the arrayed Outputs spirv_add_outputs would add there). The variable keeps its id and word
+// position. New ids come from the module bound; every new pointer type and constant sits just before the variable that
+// uses it, after the types and constants it refers to, so each id is defined before its uses. The variable's
+// decorations go, as does its id in the OpEntryPoint interface list. NULL when no Input matches.
+static uint32_t *spirv_inputs_to_private(const uint32_t *w, uint64_t n, uint32_t missing, uint64_t *out_n) {
+    enum { SC_INPUT = 1, SC_PRIVATE = 6, OP_TYPE_BOOL = 20, OP_CONSTANT_TRUE = 41, OP_CONSTANT_FALSE = 42,
+           OP_DECORATE_ID = 332, OP_DECORATE_STRING = 5632 };
+    if (n < 5 || !missing) return NULL;
+    uint32_t bound = w[3];
+    if (!bound || bound > (1u << 22)) return NULL;
+    uint32_t ids = bound;   // original ids: `mod` is only sized for these
+    int32_t *loc = malloc((size_t)bound * 4);
+    uint32_t *ptr_to = calloc(bound, 4), *priv_ptr = calloc(bound, 4), *var_type = calloc(bound, 4);
+    uint32_t *var_pointee = calloc(bound, 4), *vec_comp = calloc(bound, 4);
+    uint32_t *zero_of = calloc(bound, 4), *one_of = calloc(bound, 4);
+    uint8_t *scalar = calloc(bound, 1), *vec_n = calloc(bound, 1), *var_storage = calloc(bound, 1);
+    uint8_t *mod = calloc(bound, 1);
+    uint32_t *o = NULL, nmod = 0;
+    if (!loc || !ptr_to || !priv_ptr || !var_type || !var_pointee || !vec_comp || !zero_of || !one_of ||
+        !scalar || !vec_n || !var_storage || !mod)
+        goto done;
+    for (uint32_t i = 0; i < bound; i++) loc[i] = -1;
+    for (uint64_t i = 5; i < n;) {
+        uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
+        if (!len || i + len > n) goto done;
+        const uint32_t *a = w + i + 1;
+        if (op == SPV_OP_DECORATE && len >= 4 && a[1] == SPV_DEC_LOCATION && a[0] < bound) loc[a[0]] = (int32_t)a[2];
+        else if (op == SPV_OP_TYPE_FLOAT && len >= 3 && a[1] == 32 && a[0] < bound) scalar[a[0]] = 1;
+        else if (op == SPV_OP_TYPE_INT && len >= 4 && a[1] == 32 && a[0] < bound) scalar[a[0]] = 2;
+        else if (op == OP_TYPE_BOOL && len >= 2 && a[0] < bound) scalar[a[0]] = 3;
+        else if (op == SPV_OP_TYPE_VECTOR && len >= 4 && a[0] < bound)
+            vec_comp[a[0]] = a[1], vec_n[a[0]] = (uint8_t)a[2];
+        else if (op == SPV_OP_TYPE_POINTER && len >= 4 && a[0] < bound) {
+            ptr_to[a[0]] = a[2];
+            if (a[1] == SC_PRIVATE && a[2] < bound && !priv_ptr[a[2]]) priv_ptr[a[2]] = a[0];
+        } else if (op == SPV_OP_CONSTANT && len >= 4 && a[0] < bound && a[1] < bound) {
+            uint32_t t = a[0], id = a[1], val = a[2];
+            if (scalar[t] == 1 && !val) zero_of[t] = id;
+            else if (scalar[t] == 1 && val == 0x3f800000u) one_of[t] = id;
+            else if (scalar[t] == 2 && !val) zero_of[t] = id;
+            else if (scalar[t] == 2 && val == 1) one_of[t] = id;
+        } else if (op == OP_CONSTANT_TRUE && len >= 3 && a[0] < bound && a[1] < bound) one_of[a[0]] = a[1];
+        else if (op == OP_CONSTANT_FALSE && len >= 3 && a[0] < bound && a[1] < bound) zero_of[a[0]] = a[1];
+        else if (op == SPV_OP_VARIABLE && len >= 4 && a[1] < bound)
+            var_type[a[1]] = a[0], var_storage[a[1]] = (uint8_t)a[2];
+        i += len;
+    }
+    for (uint32_t id = 1; id < bound; id++)
+        if (var_storage[id] == SC_INPUT && loc[id] >= 0 && loc[id] < 32 && (missing >> loc[id] & 1) &&
+            var_type[id] < bound && ptr_to[var_type[id]] && ptr_to[var_type[id]] < bound) {
+            var_pointee[id] = ptr_to[var_type[id]];
+            mod[id] = 1, nmod++;
+        }
+    if (!nmod) goto done;
+    o = malloc(((size_t)n + (size_t)nmod * 32 + 16) * 4);
+    if (!o) goto done;
+    uint32_t *p = o;
+    memcpy(p, w, 5 * 4), p += 5;
+    for (uint64_t i = 5; i < n;) {
+        uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
+        const uint32_t *a = w + i + 1;
+        if (op == SPV_OP_ENTRY_POINT && len >= 3) {
+            // The name is a null-terminated literal; the interface ids follow the word that holds its terminator.
+            uint32_t k = 2;
+            while (k < len - 1) {
+                uint32_t x = a[k];
+                if (!(x & 0xff) || !(x & 0xff00) || !(x & 0xff0000) || !(x & 0xff000000)) break;
+                k++;
+            }
+            if (k < len - 1) {
+                uint32_t keep = 0;
+                for (uint32_t j = k + 1; j < len - 1; j++) keep += !(a[j] < ids && mod[a[j]]);
+                *p++ = (k + 2 + keep) << 16 | SPV_OP_ENTRY_POINT;
+                memcpy(p, a, (size_t)(k + 1) * 4), p += k + 1;
+                for (uint32_t j = k + 1; j < len - 1; j++)
+                    if (!(a[j] < ids && mod[a[j]])) *p++ = a[j];
+                i += len;
+                continue;
+            }
+        }
+        if ((op == SPV_OP_DECORATE || op == OP_DECORATE_ID || op == OP_DECORATE_STRING) && len >= 2 && a[0] < ids &&
+            mod[a[0]]) {
+            i += len;
+            continue;
+        }
+        if (op == SPV_OP_VARIABLE && len >= 4 && a[1] < ids && mod[a[1]]) {
+            // New declarations go immediately before this variable: its original position already follows every type
+            // and constant it uses, so each new id is defined before its first use.
+            uint32_t var = a[1], type = var_pointee[var], ptr = priv_ptr[type], init;
+            if (!ptr) {
+                ptr = bound++, priv_ptr[type] = ptr;
+                *p++ = 4u << 16 | SPV_OP_TYPE_POINTER, *p++ = ptr, *p++ = SC_PRIVATE, *p++ = type;
+            }
+            if (vec_n[type] == 4 && vec_comp[type] < bound && scalar[vec_comp[type]]) {
+                uint32_t comp = vec_comp[type], kind = scalar[comp], z = zero_of[comp], one = one_of[comp];
+                if (!z) {   // OpConstant 0 of the component type, reused when the module has one
+                    z = bound++;
+                    if (kind == 3) *p++ = 3u << 16 | OP_CONSTANT_FALSE, *p++ = comp, *p++ = z;
+                    else *p++ = 4u << 16 | SPV_OP_CONSTANT, *p++ = comp, *p++ = z, *p++ = 0;
+                    zero_of[comp] = z;
+                }
+                if (!one) {   // OpConstant 1 (float: the bits of 1.0f), reused when the module has one
+                    one = bound++;
+                    if (kind == 3) *p++ = 3u << 16 | OP_CONSTANT_TRUE, *p++ = comp, *p++ = one;
+                    else *p++ = 4u << 16 | SPV_OP_CONSTANT, *p++ = comp, *p++ = one,
+                                    *p++ = kind == 1 ? 0x3f800000u : 1;
+                    one_of[comp] = one;
+                }
+                init = bound++;
+                *p++ = 7u << 16 | SPV_OP_CONSTANT_COMPOSITE, *p++ = type, *p++ = init;
+                *p++ = z, *p++ = z, *p++ = z, *p++ = one;
+            } else {
+                init = bound++;
+                *p++ = 3u << 16 | SPV_OP_CONSTANT_NULL, *p++ = type, *p++ = init;
+            }
+            *p++ = 5u << 16 | SPV_OP_VARIABLE, *p++ = ptr, *p++ = var, *p++ = SC_PRIVATE, *p++ = init;
+            i += len;
+            continue;
+        }
+        memcpy(p, w + i, (size_t)len * 4), p += len;
+        i += len;
+    }
+    o[3] = bound;
+    *out_n = (uint64_t)(p - o);
+done:
+    free(loc), free(ptr_to), free(priv_ptr), free(var_type), free(var_pointee), free(vec_comp);
+    free(zero_of), free(one_of), free(scalar), free(vec_n), free(var_storage), free(mod);
+    return o;
+}
+
 // LOCAL TEST (Ocarina): the Locations a mesh module writes per primitive (Output variables decorated PerPrimitiveEXT, 5271).
 static uint32_t spirv_prim_mask(const uint32_t *w, uint64_t n) {
     uint32_t bound = w[3] < (1u << 22) ? w[3] : (1u << 22), mask = 0;
@@ -2267,8 +2399,8 @@ static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Lay
     VkShaderModule vm = VK_NULL_HANDLE, fm = VK_NULL_HANDLE, gm = VK_NULL_HANDLE;
     uint64_t vw, fw;
     const uint32_t *vcode = gfx_shader_spirv(s->vs, &vw);
-    uint32_t *vpatched = NULL, *fpatched = NULL;
-    if (!s->gs && l->set1) {   // independent layouts: outputs from the vertex shader's union
+    uint32_t *vpatched = NULL, *fpatched = NULL, mesh_private = 0;
+    if (!s->gs && l->set1 && !mesh_vs(s)) {   // independent layouts: outputs from the vertex shader's union
         GfxShaderIo fin[32];
         uint32_t missing = vs_union_missing(s, fin);
         if (missing) {
@@ -2288,14 +2420,25 @@ static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Lay
                 else if (vout[i].type != fin[i].type)
                     LOG_ONCE("vk_pipeline: varying %d is type %d in the vertex stage, %d in the fragment stage", i, vout[i].type, fin[i].type);
             }
-            if (missing && !l->set1) {
-                uint64_t n2 = 0;
-                vpatched = spirv_add_outputs(vcode, vw, missing, fin, &n2);
-                if (!vpatched) LOG_ONCE("vk_pipeline: cannot add missing vertex outputs (mask %#x)", missing);
-                else vcode = vpatched, vw = n2;
+            if (missing) {
+                if (mesh_vs(s)) mesh_private = missing;   // the mesh module stays untouched: the fragment reads them private
+                else if (!l->set1) {
+                    uint64_t n2 = 0;
+                    vpatched = spirv_add_outputs(vcode, vw, missing, fin, &n2);
+                    if (!vpatched) LOG_ONCE("vk_pipeline: cannot add missing vertex outputs (mask %#x)", missing);
+                    else vcode = vpatched, vw = n2;
+                }
             }
         }
         const uint32_t *fcode = fs_spirv_over(s->fs, &fw);
+        if (fcode && mesh_private) {
+            uint64_t n2 = 0;
+            uint32_t *p = spirv_inputs_to_private(fcode, fw, mesh_private, &n2);
+            if (p) {
+                fpatched = p, fcode = p, fw = n2;
+                LOG_ONCE("vk_pipeline: mesh stage lacks fragment inputs %#x; the fragment shader reads them private", mesh_private);
+            } else LOG_ONCE("vk_pipeline: cannot make missing mesh fragment inputs private (mask %#x)", mesh_private);
+        }
         if (k->alpha && fcode) {   // before spirv_dual_source, which adds a second output at Location 0
             uint64_t n2 = 0;
             uint32_t *a = spirv_alpha_test(fcode, fw, k->alpha, k->alpha_ref, &n2);
