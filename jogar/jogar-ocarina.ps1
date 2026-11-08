@@ -3,6 +3,9 @@ $env:PATH = "C:\msys64\ucrt64\bin;$env:PATH"
 if (Get-CimInstance Win32_VideoController | Where-Object { $_.Name -match 'NVIDIA' }) { $env:TOTK_GPU_NAME = "NVIDIA" }
 # Without an NVIDIA card keep the ten giant compute programs skipped (v0.2.7 runs eight of them: ~400 ms per frame on an AMD iGPU).
 if (-not $env:TOTK_GPU_NAME -and -not $env:DKB_SKIP_CS) { $env:DKB_SKIP_CS = "3bdfe449de832903,909139c13b510f1f,753f8ab880fe7923,c968ad44272dcbb4,785a41d2df6dc095,db8c39bdb420e068,dec1feb3c7fa967a,09931d0c57c6b67f,13cab66ee383c4f4,3f6f2b1d671badcd" }
+# Without an NVIDIA card use the Vulkan graphics pipeline library: a draw whose pipeline is still compiling gets a fast-linked one
+# (the compile takes about 1 s per new pipeline on AMD and the draw otherwise waits or is skipped).
+if (-not $env:TOTK_GPU_NAME -and -not $env:TOTK_GPL) { $env:TOTK_GPL = "1" }
 $raiz = Split-Path $PSScriptRoot -Parent
 $env:TOTK_PROFILE_DIR = Join-Path $raiz "perfil"
 # The previous run's logs go to logs\ (the newest 10 runs) before this one overwrites them: a crash log used to be lost
