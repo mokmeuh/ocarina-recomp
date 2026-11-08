@@ -643,10 +643,28 @@ NVN_API(nvnQueueSubmitCommands) {
     while (f > prev && !__atomic_compare_exchange_n(&last_fence, &prev, f, 1, __ATOMIC_RELEASE, __ATOMIC_RELAXED)) {}
     __atomic_store_n(&lod_fence[no % LOD_RING], f, __ATOMIC_RELAXED);
     __atomic_store_n(&lod_issued, no, __ATOMIC_SEQ_CST);
-    {   // LOCAL TEST (Ocarina): OOT_SUBMIT_SYNC=1: the caller waits for replay and GPU, as if the game wrote nothing behind them
-        static int on = -1;
-        if (on < 0) { const char *e = getenv("OOT_SUBMIT_SYNC"); on = !(e && *e == '0'); }   // on by default: the game rewrites data the replay has not reached yet (random NaN frames otherwise)
-        if (on) gfx_backend()->fence_wait(f, 400000000);
+    {   // LOCAL TEST (Ocarina): OOT_SUBMIT_SYNC=0|1|lagN: how far the caller lags the replay and GPU, as if the game
+        // wrote nothing behind them. Unset, 1 or any other text waits for the submit just made; lag1..lag8 wait for the
+        // submit made N submissions earlier, so the GPU works on the previous frame while the game prepares the next.
+        static int mode = -1;   // -1 unparsed; 0 off; 1 the submit just made; 2 the submit 'lag' earlier
+        static unsigned lag;
+        if (mode < 0) {
+            const char *e = getenv("OOT_SUBMIT_SYNC");
+            if (e && !strcmp(e, "0")) { mode = 0; rt_log("nvn: submit sync: off"); }
+            else if (e && e[0] == 'l' && e[1] == 'a' && e[2] == 'g' && e[3] >= '1' && e[3] <= '8' && !e[4]) {
+                mode = 2;
+                lag = (unsigned)(e[3] - '0');
+                rt_log("nvn: submit sync: wait for the submit %u earlier", lag);
+            } else {
+                mode = 1;
+                rt_log("nvn: submit sync: wait for the current submit");
+            }
+        }
+        if (mode == 1) gfx_backend()->fence_wait(f, 400000000);
+        else if (mode == 2 && no > lag) {
+            uint64_t g = __atomic_load_n(&lod_fence[(no - lag) % LOD_RING], __ATOMIC_RELAXED);
+            gfx_backend()->fence_wait(g, 400000000);
+        }
     }
 }
 
