@@ -1,18 +1,26 @@
-# Button-prompt overlay for Ocarina (Switch 2 build, Nin_Ounce_NVN2): the A and B, and the X and Y prompts swapped, for
-# pad_layout = xbox_prompts (runtime/romfs.c overlay_init loads romfs-patches-xbox next to romfs-index.bin).
+# Button-prompt overlay for Ocarina (Switch 2 build, Nin_Ounce_NVN2): the action prompt's face-button diamond redrawn for an
+# Xbox pad, for pad_layout = xbox_prompts (runtime/romfs.c overlay_init loads romfs-patches-xbox next to romfs-index.bin).
 #
-# The glyph, BNTX and CFF routines are adapted from tools/make_romfs_patches.py (itself adapted from MacNativeGames
-# games/totk/scripts/make_romfs_patches.py, MIT, Copyright (c) 2026 MacNativeGames contributors).
+# With that layout the buttons are played by their Xbox names: the bottom button (A) does the game's A, the right one (B)
+# the game's B, the left one (X) the game's X, the top one (Y) the game's Y. The letters the game draws are right as they
+# are (A stays A); what is wrong is where the Switch puts them: A right, B bottom, X top, Y left. This overlay moves the
+# positions, A <-> B and X <-> Y, and leaves every letter alone. Built from the game's own data on the player's own copy;
+# nothing is added and the output is derived from the game: never commit or share it.
 #
-# That layout plays an Xbox pad by position, as nintendo does: the right button, labelled B, does Switch A. The prompts
-# should then name the label, so what the game draws for A and B (X and Y) is exchanged. Built from the game's own data on
-# the player's own copy; nothing is added and the output is derived from the game: never commit or share it.
-#   - Font2/Scalable/External.Nin_Ounce_NVN2.bfotf.zs: the button glyphs U+E040 A, U+E041 B, U+E042 X, U+E043 Y (the text of
-#     every prompt: LayoutMsg/DoCommand_00.msbt T_KeyA_00.. and the message bodies use them). CFF outlines and horizontal
-#     metrics swapped.
-#   - UI/Layout2Archive/Common.Product.100.Nin_Ounce_NVN2.bntx.zs: the images KeyTexFontA/B/X/Y_00 (64x64 BC4) and
-#     OcarinaButtonA/B/X/Y_00 (ocarina notes), swapped pair by pair; each pair has the same format, size and tiling.
-# Not covered: the Chinese fonts FZLTHB and FZLTZHB (TrueType) also hold U+E040..E043; zh-CN/zh-TW keep the Switch letters.
+# What encodes the position, in UI/Layout2Archive/Common.Product.100.Nin_Ounce_NVN2.blarc.zs, layout DoCommand_00 (four
+# identical copies in the archive; the archive's member names are cut, so they are found by their first characters):
+#   - the pane records (BFFH, 68 bytes each, from RootPane on, in the order of the names of the string pool): translation
+#     (x, y) at +36 and +40, scale at +24 and +28, parent index at +48. Each of the four variants N_A_00, N_B_00, N_X_00 and
+#     N_Y_00 (the prompt of that button) holds the highlighted button N_Btn<L>_00 and the three other buttons as panes
+#     P_<letter>_<n>, one on each arm of the diamond at (+-80, 0) and (0, +-80). The Switch has A right, B bottom, X top,
+#     Y left; the Xbox has A bottom, B right, X left, Y top: every one of those four positions (x, y) becomes (-y, -x).
+#   - the picture behind them, a silhouette of the three circles that are not the highlighted one: the BC4 textures
+#     DoCommandCrossBase_A_00 (no circle at the right) and DoCommandCrossBase_B_00 (none at the bottom), with their gradient
+#     DoCommandCrossBaseGrd_*, bound by name in the first material of each variant. X reuses _B with the picture's scale y
+#     at -1 (no circle at the top) and Y reuses _A with the scale x at -1 (none at the left). The textures of A and B, and
+#     of X and Y (with their scales), are exchanged so that the silhouette follows the highlighted button.
+# Not covered: the ocarina notes (PaOcarinaSingleNote_00) are a column by pitch, not a diamond; the controller picture
+# (PaSystemController_00) and the button-letter glyphs and textures are left as the game has them.
 #
 # Input: build/romfs (romfs.bin and index.json). Output: build/oot111/romfs-patches-xbox/<path> and manifest.tsv
 # (path, size, SHA-256 of the file, SHA-256 of the original), checked at start by the runtime. Run with the embedded Python
@@ -22,28 +30,29 @@ import compression.zstd as zstd
 import hashlib
 import json
 import os
+import re
+import shutil
 import struct
 from pathlib import Path
 
 root = Path(__file__).resolve().parents[2]
-ap = argparse.ArgumentParser(description='Build romfs-patches-xbox: the A/B and X/Y button prompts of Ocarina swapped.')
+ap = argparse.ArgumentParser(description='Build romfs-patches-xbox: the action prompt diamond of Ocarina laid out as an Xbox pad.')
 ap.add_argument('--romfs', type=Path, default=root / 'build' / 'romfs', help='folder with romfs.bin and index.json')
 ap.add_argument('--out', type=Path, default=root / 'build' / 'oot111' / 'romfs-patches-xbox')
-ap.add_argument('--level', type=int, default=12, help='zstd level of the recompressed files (the BNTX is 244 MB)')
+ap.add_argument('--level', type=int, default=12, help='zstd level of the recompressed archive')
 args = ap.parse_args()
 
-FONT = 'Font2/Scalable/External.Nin_Ounce_NVN2.bfotf.zs'
-BNTX = 'UI/Layout2Archive/Common.Product.100.Nin_Ounce_NVN2.bntx.zs'
-KEY_GLYPHS = ((0xE040, 0xE041), (0xE042, 0xE043))   # A B, X Y
-KEY_TEXTURES = (('KeyTexFontA_00', 'KeyTexFontB_00'), ('KeyTexFontX_00', 'KeyTexFontY_00'),
-                ('OcarinaButtonA_00', 'OcarinaButtonB_00'), ('OcarinaButtonX_00', 'OcarinaButtonY_00'))
+BLARC = 'UI/Layout2Archive/Common.Product.100.Nin_Ounce_NVN2.blarc.zs'
+LAYOUT = 'DoCommand_00'
+VARIANTS = 'ABXY'
 
 index = json.loads((args.romfs / 'index.json').read_text())
 assert index['status'] == 'pass', 'build/romfs/index.json is not a verified extraction'
 files = {f['path']: f for f in index['files']}
 
 
-def sarc_members(data):
+def sarc_nodes(data):
+    """(name, start, end) of every SARC member, in SFAT order."""
     assert data[:4] == b'SARC' and data[6:8] == b'\xff\xfe'
     header, size, start = struct.unpack_from('<HxxII', data, 4)
     assert size == len(data) and data[header:header + 4] == b'SFAT'
@@ -51,162 +60,101 @@ def sarc_members(data):
     names = header + 12 + count * 16
     assert data[names:names + 4] == b'SFNT'
     names += 8
-    out = {}
+    out = []
     for i in range(count):
         _, attribute, lo, hi = struct.unpack_from('<4I', data, header + 12 + i * 16)
         offset = names + (attribute & 0xffffff) * 4
-        out[data[offset:data.index(0, offset, start)].decode()] = (start + lo, start + hi)
+        out.append((data[offset:data.index(0, offset, start)].decode(), start + lo, start + hi))
     return out
 
 
-def bntx_swap(data, pairs):
-    """Swap the image data of each (name, name) pair of textures in the BNTX data (a bytearray). Both of a pair must
-    have the same header from flags to layout (format, size, tiling, mips) and image size, so the bytes of one are a
-    valid image of the other."""
-    assert data[:4] == b'BNTX' and data[0x20:0x24] in (b'NX  ', b'Ounc'), data[:0x24]
-    count, table = struct.unpack_from('<IQ', data, 0x24)
-    found = {}
-    for k in range(count):
-        info = struct.unpack_from('<Q', data, table + 8 * k)[0]
-        assert data[info:info + 4] == b'BRTI'
-        name = struct.unpack_from('<Q', data, info + 0x60)[0]
-        name = data[name + 2:name + 2 + struct.unpack_from('<H', data, name)[0]].decode().split('^')[0]
-        mips = struct.unpack_from('<Q', data, info + 0x70)[0]
-        shape = bytes(data[info + 0x10:info + 0x3c]) + bytes(data[info + 0x50:info + 0x54])
-        found[name] = (shape, struct.unpack_from('<Q', data, mips)[0], struct.unpack_from('<I', data, info + 0x50)[0])
-    for a, b in pairs:
-        assert a in found and b in found, f'{a} or {b} missing from the texture list'
-        (shape_a, at_a, size), (shape_b, at_b, _) = found[a], found[b]
-        assert shape_a == shape_b, f'{a} and {b} differ in format, size or tiling'
-        data[at_a:at_a + size], data[at_b:at_b + size] = data[at_b:at_b + size], data[at_a:at_a + size]
-    return found
+def is_float(word, lo, hi):
+    f = struct.unpack('<f', struct.pack('<I', word))[0]
+    return f == f and lo <= f <= hi
 
 
-def cff_index(data, pos):
-    count = struct.unpack_from('>H', data, pos)[0]
-    if not count:
-        return [], 0, pos + 2
-    size = data[pos + 2]
-    offsets = [int.from_bytes(data[pos + 3 + i * size:pos + 3 + (i + 1) * size], 'big') for i in range(count + 1)]
-    first = pos + 2 + (count + 1) * size
-    return [(first + offsets[i], first + offsets[i + 1]) for i in range(count)], size, first + offsets[-1]
+def pane_record_ok(m, o, i):
+    w = struct.unpack_from('<17I', m, o)
+    return (is_float(w[6], -20, 20) and is_float(w[7], -20, 20) and is_float(w[9], -6000, 6000) and is_float(w[10], -6000, 6000)
+            and is_float(w[13], 0, 6000) and is_float(w[14], 0, 6000) and w[6] != 0 and w[7] != 0
+            and (w[12] == 0xffffffff or w[12] < i))
 
 
-def cff_charstrings(data, cff):
-    """The offset (from the CFF table) of the CharStrings INDEX: operator 17 of the Top DICT. CID-keyed fonts are refused."""
-    _, _, pos = cff_index(data, cff + data[cff + 2])
-    top, _, _ = cff_index(data, pos)
-    (pos, end), operands, found = top[0], [], None
-    while pos < end:
-        b = data[pos]
-        if b <= 21:
-            op = (12, data[pos + 1]) if b == 12 else b
-            pos += 2 if b == 12 else 1
-            assert op != (12, 30), 'CID-keyed CFF'
-            if op == 17:
-                found = operands[-1]
-            operands = []
-        elif b == 28:
-            operands.append(struct.unpack_from('>h', data, pos + 1)[0]); pos += 3
-        elif b == 29:
-            operands.append(struct.unpack_from('>i', data, pos + 1)[0]); pos += 5
-        elif b == 30:
-            pos += 1
-            while data[pos] & 0x0f != 0x0f and data[pos] & 0xf0 != 0xf0:
-                pos += 1
-            pos += 1
-            operands.append(0)
-        elif b <= 246:
-            operands.append(b - 139); pos += 1
-        elif b <= 250:
-            operands.append((b - 247) * 256 + data[pos + 1] + 108); pos += 2
-        else:
-            operands.append(-(b - 251) * 256 - data[pos + 1] - 108); pos += 2
-    assert found is not None, 'no CharStrings in the Top DICT'
-    return found
-
-
-def otf_glyph(data, cmap, code):
-    for k in range(struct.unpack_from('>H', data, cmap + 2)[0]):
-        platform, encoding, offset = struct.unpack_from('>HHI', data, cmap + 4 + 8 * k)
-        p = cmap + offset
-        if (platform, encoding) != (3, 1) or struct.unpack_from('>H', data, p)[0] != 4:
+def find_panes(m):
+    """(offset of the first pane record, number of records): the longest run of 68-byte records whose first has no parent."""
+    best = (0, 0)
+    for o in range(0x100, min(len(m) - 68 * 4, 0x4000), 4):
+        if struct.unpack_from('<I', m, o + 48)[0] != 0xffffffff or not pane_record_ok(m, o, 0):
             continue
-        seg = struct.unpack_from('>H', data, p + 6)[0] // 2
-        for s in range(seg):
-            end = struct.unpack_from('>H', data, p + 14 + 2 * s)[0]
-            start = struct.unpack_from('>H', data, p + 16 + 2 * seg + 2 * s)[0]
-            if not start <= code <= end:
-                continue
-            delta = struct.unpack_from('>h', data, p + 16 + 4 * seg + 2 * s)[0]
-            at = p + 16 + 6 * seg + 2 * s
-            ro = struct.unpack_from('>H', data, at)[0]
-            glyph = code if not ro else struct.unpack_from('>H', data, at + ro + 2 * (code - start))[0]
-            return (glyph + delta) & 0xffff if glyph else 0
-    raise AssertionError(f'U+{code:04X} is not in the font')
+        k = 0
+        while o + 68 * (k + 1) <= len(m) and pane_record_ok(m, o + 68 * k, k):
+            k += 1
+        if k > best[1]:
+            best = (o, k)
+    return best
 
 
-def otf_checksum(data):
-    data = bytes(data) + bytes(-len(data) % 4)
-    return sum(struct.unpack(f'>{len(data) // 4}I', data)) & 0xffffffff
+def string_pool(m):
+    """[(offset, string)] of the null-terminated strings from the layout's name on (the pane names come first)."""
+    at = m.find(b'RootPane')
+    pos = m.rfind(b'\x00', 0, at - 1) + 1
+    names = []
+    while pos < len(m) and m[pos]:
+        end = m.index(b'\x00', pos)
+        names.append((pos, m[pos:end].decode()))
+        pos = end + 1
+    return names
 
 
-def bfotf_decode(data):
-    """(plain bytearray, key): a BFOTF is an OpenType font after an 8-byte header; from offset 4 on, every 4-byte word is
-    XORed with one key, which the size field gives away (it holds the font's length)."""
-    key = bytes(x ^ y for x, y in zip(data[4:8], struct.pack('>I', len(data) - 8)))
-    return bytearray(data[:4]) + bytearray(x ^ key[i % 4] for i, x in enumerate(data[4:])), key
+def patch_layout(m):
+    """Patch one DoCommand_00 (a bytearray) in place; returns the positions moved."""
+    first, count = find_panes(m)
+    pool = string_pool(m)
+    names = [n for _, n in pool]
+    assert names[0] == LAYOUT and names[1] == 'RootPane' and count >= 60, (names[:3], count)
+    pane = {names[1 + i]: i for i in range(count)}   # pane name -> record index
 
+    def rec(i):
+        return first + 68 * i
 
-def bfotf_swap(data, pairs):
-    """The BFOTF data with the glyphs of each (code point, code point) pair swapped: CFF outlines and horizontal metrics,
-    then the table checksums."""
-    plain, key = bfotf_decode(data)
-    font = plain[8:]
-    assert font[:4] == b'OTTO', 'not a CFF OpenType font'
-    tables = {}
-    for k in range(struct.unpack_from('>H', font, 4)[0]):
-        tag, _, offset, length = struct.unpack_from('>4sIII', font, 12 + 16 * k)
-        tables[tag] = (12 + 16 * k, offset, length)
-    cff = tables[b'CFF '][1]
-    strings, size, end = cff_index(font, cff + cff_charstrings(font, cff))
-    hmtx, metrics = tables[b'hmtx'][1], struct.unpack_from('>H', font, tables[b'hhea'][1] + 34)[0]
-    order = list(range(len(strings)))
-    for a, b in pairs:
-        ga, gb = otf_glyph(font, tables[b'cmap'][1], a), otf_glyph(font, tables[b'cmap'][1], b)
-        assert 0 < ga < len(strings) and 0 < gb < len(strings) and ga < metrics and gb < metrics, (a, b, ga, gb)
-        order[ga], order[gb] = order[gb], order[ga]
-        ma, mb = hmtx + 4 * ga, hmtx + 4 * gb
-        font[ma:ma + 4], font[mb:mb + 4] = font[mb:mb + 4], font[ma:ma + 4]
-    body = b''.join(bytes(font[slice(*strings[g])]) for g in order)
-    first = strings[0][0]
-    assert first + len(body) == end
-    font[first:end] = body
-    at, base = first - (len(strings) + 1) * size, 1
-    for i, g in enumerate(order + [None]):
-        font[at + i * size:at + (i + 1) * size] = base.to_bytes(size, 'big')
-        if g is not None:
-            base += strings[g][1] - strings[g][0]
-    head = tables[b'head'][1]
-    struct.pack_into('>I', font, head + 8, 0)
-    for entry, offset, length in tables.values():
-        struct.pack_into('>I', font, entry + 4, otf_checksum(font[offset:offset + length]))
-    struct.pack_into('>I', font, head + 8, (0xb1b0afba - otf_checksum(font)) & 0xffffffff)
-    plain[8:] = font
-    return bytes(plain[:4]) + bytes(x ^ key[i % 4] for i, x in enumerate(plain[4:]))
+    def pos(i):
+        return struct.unpack_from('<ff', m, rec(i) + 36)
 
-
-def glyph_outline(data, code):
-    """The CharString bytes of the glyph of a code point in the BFOTF data."""
-    font = bfotf_decode(data)[0][8:]
-    tables = {}
-    for k in range(struct.unpack_from('>H', font, 4)[0]):
-        tag, _, offset, length = struct.unpack_from('>4sIII', font, 12 + 16 * k)
-        tables[tag] = offset
-    cff = tables[b'CFF ']
-    strings, _, _ = cff_index(font, cff + cff_charstrings(font, cff))
-    lo, hi = strings[otf_glyph(font, tables[b'cmap'], code)]
-    return bytes(font[lo:hi])
+    moved = {}
+    for v in VARIANTS:
+        root_i = pane[f'N_{v}_00']
+        group = [pane[f'N_Btn{v}_00']] + [i for i in range(count)
+                                          if struct.unpack_from('<I', m, rec(i) + 48)[0] == root_i
+                                          and re.fullmatch(r'P_[ABXY]_\d\d', names[1 + i])]
+        assert len(group) == 4, (v, [names[1 + i] for i in group])
+        arms = sorted(tuple(round(c) for c in pos(i)) for i in group)
+        assert arms == [(-80, 0), (0, -80), (0, 80), (80, 0)], (v, arms)
+        for i in group:
+            x, y = pos(i)
+            struct.pack_into('<ff', m, rec(i) + 36, -y + 0.0, -x + 0.0)
+            moved[names[1 + i]] = (round(x), round(y), round(-y), round(-x))
+    # the silhouette: the name pointers (8 bytes, an offset in this member) of the texture bindings, two per name, in the
+    # order of the variants A, B, X, Y
+    strings = {}
+    for hit in re.finditer(rb'[A-Za-z_][A-Za-z0-9_]{3,}(?=\x00)', bytes(m[pool[0][0]:])):
+        strings.setdefault(hit.group().decode(), pool[0][0] + hit.start())
+    bindings = {}
+    for n in ('DoCommandCrossBase_A_00', 'DoCommandCrossBase_B_00', 'DoCommandCrossBaseGrd_A_00', 'DoCommandCrossBaseGrd_B_00'):
+        bindings[n] = [o for o in range(0, len(m) - 8, 4) if struct.unpack_from('<Q', m, o)[0] == strings[n]]
+        assert len(bindings[n]) == 2, (n, bindings[n])
+    (a_cb, y_cb), (b_cb, x_cb) = bindings['DoCommandCrossBase_A_00'], bindings['DoCommandCrossBase_B_00']
+    (a_gr, y_gr), (b_gr, x_gr) = bindings['DoCommandCrossBaseGrd_A_00'], bindings['DoCommandCrossBaseGrd_B_00']
+    assert a_cb < b_cb < x_cb < y_cb and a_gr < b_gr < x_gr < y_gr, (a_cb, b_cb, x_cb, y_cb)
+    for p, q in ((a_cb, b_cb), (x_cb, y_cb), (a_gr, b_gr), (x_gr, y_gr)):   # A <-> B, X <-> Y
+        vp, vq = struct.unpack_from('<Q', m, p)[0], struct.unpack_from('<Q', m, q)[0]
+        struct.pack_into('<Q', m, p, vq)
+        struct.pack_into('<Q', m, q, vp)
+    # X and Y: the flip of the silhouette goes with its texture (X: _A flipped at x, Y: _B flipped at y)
+    bx, by = rec(pane['P_BaseX_00']), rec(pane['P_BaseY_00'])
+    assert struct.unpack_from('<ff', m, bx + 24) == (1.0, -1.0) and struct.unpack_from('<ff', m, by + 24) == (-1.0, 1.0)
+    struct.pack_into('<ff', m, bx + 24, -1.0, 1.0)
+    struct.pack_into('<ff', m, by + 24, 1.0, -1.0)
+    return moved
 
 
 with (args.romfs / 'romfs.bin').open('rb') as image:
@@ -218,56 +166,38 @@ with (args.romfs / 'romfs.bin').open('rb') as image:
         return b
     dictionaries = {}
     pack = zstd.decompress(read('Pack/ZsDic.pack.zs'))
-    for name, (lo, hi) in sarc_members(pack).items():
+    for _, lo, hi in sarc_nodes(pack):
         d = zstd.ZstdDict(pack[lo:hi])
         dictionaries[d.dict_id] = d
-    originals = {path: read(path) for path in (FONT, BNTX)}
+    original = read(BLARC)
 
+frame = zstd.get_frame_info(original)
+dictionary = dictionaries.get(frame.dictionary_id)
+plain = zstd.decompress(original, zstd_dict=dictionary)
+assert len(plain) == frame.decompressed_size
+blarc = bytearray(plain)
+copies = [(lo, hi) for name, lo, hi in sarc_nodes(plain) if name.startswith(LAYOUT)]
+assert len(copies) == 4 and len({plain[lo:hi] for lo, hi in copies}) == 1, 'DoCommand_00 is expected as four identical copies'
+done = None
+for lo, hi in copies:
+    member = bytearray(plain[lo:hi])
+    done = patch_layout(member)
+    blarc[lo:hi] = member
+changed = [i for i in range(len(plain)) if plain[i] != blarc[i]]
+assert changed and all(any(lo <= i < hi for lo, hi in copies) for i in changed), 'bytes outside DoCommand_00 changed'
 
-def unpack(path):
-    raw = originals[path]
-    frame = zstd.get_frame_info(raw)
-    return zstd.decompress(raw, zstd_dict=dictionaries.get(frame.dictionary_id)), frame.dictionary_id
+workers = max(1, min(8, (os.cpu_count() or 2) - 1))
+options = {zstd.CompressionParameter.compression_level: args.level, zstd.CompressionParameter.nb_workers: workers}
+data = zstd.compress(bytes(blarc), options=options, zstd_dict=dictionary)
+assert zstd.decompress(data, zstd_dict=dictionary) == bytes(blarc)
+assert zstd.get_frame_info(data).dictionary_id == frame.dictionary_id
 
-
-def pack_zs(path, contents):
-    raw = originals[path]
-    frame = zstd.get_frame_info(raw)
-    dictionary = dictionaries.get(frame.dictionary_id)
-    workers = max(1, min(8, (os.cpu_count() or 2) - 1))
-    options = {zstd.CompressionParameter.compression_level: args.level, zstd.CompressionParameter.nb_workers: workers}
-    data = zstd.compress(contents, options=options, zstd_dict=dictionary)
-    assert zstd.decompress(data, zstd_dict=dictionary) == contents
-    assert zstd.get_frame_info(data).dictionary_id == frame.dictionary_id
-    return data
-
-
-outputs = {}
-font, _ = unpack(FONT)
-swapped_font = bfotf_swap(font, KEY_GLYPHS)
-for a, b in KEY_GLYPHS:   # the outline of each glyph is now the other's
-    assert glyph_outline(swapped_font, a) == glyph_outline(font, b) and glyph_outline(swapped_font, b) == glyph_outline(font, a)
-    assert glyph_outline(font, a) != glyph_outline(font, b), 'the two glyphs are the same drawing'
-outputs[FONT] = swapped_font
-
-bntx, _ = unpack(BNTX)
-original_bntx = bytes(bntx)
-bntx = bytearray(bntx)
-found = bntx_swap(bntx, KEY_TEXTURES)
-for a, b in KEY_TEXTURES:
-    (_, at_a, size), (_, at_b, _) = found[a], found[b]
-    assert bntx[at_a:at_a + size] == original_bntx[at_b:at_b + size] and bntx[at_b:at_b + size] == original_bntx[at_a:at_a + size]
-    assert original_bntx[at_a:at_a + size] != original_bntx[at_b:at_b + size], f'{a} and {b} hold the same image'
-assert sum(x != y for x, y in zip(bntx, original_bntx)) <= 2 * sum(found[n][2] for pair in KEY_TEXTURES for n in pair)
-outputs[BNTX] = bytes(bntx)
-
-lines = []
-for path, contents in outputs.items():
-    data = pack_zs(path, contents)
-    target = args.out / path
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_bytes(data)
-    lines.append('\t'.join([path, str(len(data)), hashlib.sha256(data).hexdigest(), hashlib.sha256(originals[path]).hexdigest()]))
+if args.out.exists():
+    shutil.rmtree(args.out)   # an older build of this folder (it held font and texture files) must not stay
+target = args.out / BLARC
+target.parent.mkdir(parents=True, exist_ok=True)
+target.write_bytes(data)
 (args.out / 'manifest.tsv').write_text('# path\tsize\tsha256\toriginal_sha256 (tools/oot/make_xbox_prompts.py)\n'
-                                       + ''.join(line + '\n' for line in lines))
-print(json.dumps(dict(status='pass', out=str(args.out), glyphs=KEY_GLYPHS, textures=KEY_TEXTURES, files=list(outputs))))
+                                       + '\t'.join([BLARC, str(len(data)), hashlib.sha256(data).hexdigest(),
+                                                    hashlib.sha256(original).hexdigest()]) + '\n')
+print(json.dumps(dict(status='pass', out=str(args.out), layout_copies=len(copies), changed_bytes=len(changed), moved=done)))
